@@ -84,3 +84,6 @@ cargo test                    # tests/ 下 4 个集成测试文件 + 单元测�
 
 `cargo test` 要重新链接 `target/debug/ToDay.exe`：**应用正在运行时系统会拒绝访问该文件**，先退出应用再跑；
 只想验证类型与测试代码能否编译时，`cargo clippy --all-targets` 不受影响。
+
+同一套命令在 `.github/workflows/ci.yml` 里跑（windows-latest，clippy 加 `-D warnings`，
+另加 `cargo doc --no-deps` 与 `cargo build --release`）。

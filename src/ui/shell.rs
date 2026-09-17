@@ -6,7 +6,7 @@
 use crate::model::MonthKey;
 use crate::ui::{calendar::weekday_name, theme};
 use chrono::NaiveDate;
-use egui::{CornerRadius, Layout, Rect, RichText, Ui, Vec2};
+use egui::{Color32, CornerRadius, Layout, Rect, RichText, Ui, Vec2};
 
 /// 侧栏宽度：日历只需要这么多，剩下的留给正文
 pub const SIDEBAR_WIDTH: f32 = 292.0;
@@ -18,6 +18,12 @@ pub const STATUS_BAR_HEIGHT: f32 = 30.0;
 const ERROR_BAR_HEIGHT: f32 = 34.0;
 /// 面板左右内边距
 const PANEL_PADDING_X: i8 = 22;
+/// 底栏那枚修饰键键帽：判据是 `Modifiers::command`，macOS 上它认的是 Cmd 不是 Ctrl
+const COMMAND_KEY: &str = if cfg!(target_os = "macos") {
+    "Cmd"
+} else {
+    "Ctrl"
+};
 
 /// 顶栏 / 底栏 / 错误条用的面板高度
 pub fn error_bar_height() -> f32 {
@@ -46,6 +52,52 @@ impl ShellAction {
             goto_today: self.goto_today || other.goto_today,
         }
     }
+}
+
+/// 保存状态：顶栏那枚状态字说什么。
+///
+/// 文案与颜色都在这里定，三个词都是纯中文：`Piece` 里混脚本会落到另一套字体上、破坏基线。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveState {
+    /// 队列空：没有待写的东西
+    Saved,
+    /// 攒着等防抖
+    Pending,
+    /// 上次写失败，编辑还压在队里，等用户点"重试"
+    Failed,
+}
+
+impl SaveState {
+    /// 这一状态下顶栏显示的字
+    fn word(self) -> &'static str {
+        match self {
+            Self::Saved => "已保存",
+            Self::Pending => "保存中",
+            Self::Failed => "未保存",
+        }
+    }
+
+    /// 状态字的颜色：只有"没写进去"必须立刻被看见
+    fn color(self) -> Color32 {
+        match self {
+            Self::Failed => theme::RED_FG,
+            Self::Saved | Self::Pending => theme::MUTED,
+        }
+    }
+
+    /// 顶栏上的一枚状态字
+    fn piece(self) -> theme::Piece<'static> {
+        theme::Piece::state(self.word(), self.color())
+    }
+}
+
+/// 错误条上用户表达的意图。视图不改状态，只把意图交上去。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ErrorAction {
+    /// 点了"知道了"：收起提示，不重试
+    pub dismissed: bool,
+    /// 点了"重试"：立刻再写一次
+    pub retry: bool,
 }
 
 /// 面板的边，用来补 1px 结构线
@@ -78,18 +130,19 @@ pub fn edge_line(ui: &Ui, rect: Rect, edge: Edge) {
         .rect_filled(line, CornerRadius::ZERO, theme::HAIRLINE);
 }
 
-/// 顶栏：品牌在左，日期与锁定在右
-pub fn top_bar(ui: &mut Ui, date: NaiveDate, today: NaiveDate) -> ShellAction {
+/// 顶栏：品牌与保存状态在左，日期与锁定在右
+pub fn top_bar(ui: &mut Ui, date: NaiveDate, today: NaiveDate, state: SaveState) -> ShellAction {
     let mut action = ShellAction::default();
 
     ui.horizontal_centered(|ui| {
-        // 品牌：拉丁与中文压在同一条基线上
+        // 品牌与状态：拉丁与中文压在同一条基线上
         theme::line(
             ui,
             theme::Edge::Inline,
             &[
                 theme::Piece::text("ToDay", theme::display(20.0), theme::INK_DEEP),
                 theme::Piece::text("一日一记", theme::sans(11.5), theme::FAINT).gap(12.0),
+                state.piece().gap(14.0),
             ],
         );
 
@@ -139,12 +192,13 @@ pub fn status_bar(ui: &mut Ui, month: MonthKey, written: usize) {
             theme::MUTED,
         );
 
-        // 键位提示：键帽在前、说明在后
+        // 键位提示：键帽在前、说明在后；一枚键一枚键帽，相邻键帽之间 4px
         theme::line(
             ui,
             theme::Edge::Right,
             &[
-                theme::Piece::key("Enter"),
+                theme::Piece::key(COMMAND_KEY),
+                theme::Piece::key("Enter").gap(4.0),
                 theme::Piece::text("下一行", theme::sans(11.5), theme::FAINT).gap(6.0),
                 theme::Piece::key("右键").gap(18.0),
                 theme::Piece::text("删除这一天", theme::sans(11.5), theme::FAINT).gap(6.0),
@@ -153,16 +207,10 @@ pub fn status_bar(ui: &mut Ui, month: MonthKey, written: usize) {
     });
 }
 
-/// 侧栏页脚：本月进度条 + 回到今天
-pub fn sidebar_footer(
-    ui: &mut Ui,
-    month: MonthKey,
-    written: usize,
-    date: NaiveDate,
-    today: NaiveDate,
-) -> ShellAction {
-    let mut action = ShellAction::default();
-
+/// 侧栏页脚：本月记录与进度条。
+///
+/// 没有"回到今天"：那个动作在顶栏（选中的不是今天时才有），这里不再重复一遍。
+pub fn sidebar_footer(ui: &mut Ui, month: MonthKey, written: usize) {
     ui.add_space(18.0);
     theme::hairline(ui);
     ui.add_space(14.0);
@@ -182,20 +230,15 @@ pub fn sidebar_footer(
 
     ui.add_space(9.0);
     theme::meter(ui, written as f32 / total as f32);
-
-    ui.add_space(20.0);
-    if date != today && theme::ghost_button(ui, "回到今天").clicked() {
-        action.goto_today = true;
-    }
-
-    action
 }
 
-/// 错误提示条：一句人话 + 一个关闭按钮。返回是否点了关闭。
+/// 错误提示条：一句人话 + 一枚按钮。
 ///
+/// `retryable` 为真时只有"重试"、没有"知道了"：编辑还压在队里，收起提示等于把
+/// 唯一的重试入口一起收走。读盘失败那种收起来不丢东西的，才给"知道了"。
 /// 面板的红底由控制器铺，这里只画内容。
-pub fn error_banner(ui: &mut Ui, message: &str) -> bool {
-    let mut dismissed = false;
+pub fn error_banner(ui: &mut Ui, message: &str, retryable: bool) -> ErrorAction {
+    let mut action = ErrorAction::default();
 
     ui.horizontal_centered(|ui| {
         // ⚠ 来自另一套字体，单独成段才跟正文同一条基线
@@ -208,13 +251,17 @@ pub fn error_banner(ui: &mut Ui, message: &str) -> bool {
             ],
         );
         ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::ghost_button(ui, "知道了").clicked() {
-                dismissed = true;
+            if retryable {
+                if theme::ghost_button(ui, "重试").clicked() {
+                    action.retry = true;
+                }
+            } else if theme::ghost_button(ui, "知道了").clicked() {
+                action.dismissed = true;
             }
         });
     });
 
-    dismissed
+    action
 }
 
 /// 居中的品牌字样，解锁界面用

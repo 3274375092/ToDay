@@ -117,3 +117,30 @@ fn a_requeued_edit_does_not_overwrite_a_newer_one() {
 
     assert_eq!(scheduler.take(), vec![Change::set(date(1), "新版")]);
 }
+
+/// 排帧的判据：写失败之后不再排帧，否则界面会以 100 fps 空转。
+#[test]
+fn only_an_edit_that_can_still_be_written_asks_for_the_next_frame() {
+    let mut scheduler = SaveScheduler::default();
+    assert!(!scheduler.needs_wakeup(), "空队列排帧也没用");
+    assert!(!scheduler.is_stuck(), "没写过就谈不上卡住");
+
+    scheduler.record(Change::set(date(1), "写了一句"), 10.0);
+    assert!(scheduler.needs_wakeup(), "攒着东西要排帧等到点");
+    assert!(!scheduler.is_stuck());
+
+    let taken = scheduler.take();
+    scheduler.requeue(taken);
+    assert!(scheduler.is_stuck(), "上次写失败了，编辑还压在队里");
+    assert!(!scheduler.needs_wakeup(), "卡住时排帧也不会写，只会空转");
+
+    // 再敲一个字：重试的机会来了，重新值得排帧
+    scheduler.record(Change::set(date(1), "又写了一点"), 20.0);
+    assert!(!scheduler.is_stuck());
+    assert!(scheduler.needs_wakeup());
+
+    // 写成功取走之后回到安静
+    scheduler.take();
+    assert!(!scheduler.is_stuck());
+    assert!(!scheduler.needs_wakeup());
+}

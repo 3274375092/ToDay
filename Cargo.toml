@@ -27,3 +27,18 @@ anyhow = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# 日常用 `cargo run`，跑的是 debug 构建：依赖里的字形光栅化（vello_cpu）、排版（harfrust）
+# 与 wgpu 在未优化下慢一个数量级，解锁与打字时都感受得到。依赖恒定开 3，自有 crate 只开 1，
+# 重编自己的代码还是秒级。改完这一段第一次 `cargo test` / `cargo clippy` 会重编全部依赖。
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# 交给用户的构建：体积与跨 crate 内联各让一步，不追求极限编译时间
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

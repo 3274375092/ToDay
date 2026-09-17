@@ -4,20 +4,24 @@
 //!
 //! * 打字按 [`SAVE_DEBOUNCE_SECONDS`] 防抖，一次写一批；
 //! * 失焦、切日期、切月份、删除、撤销、锁定、关窗 —— 立刻写；
-//! * 写失败不 panic：把编辑放回队里，把错误显示在顶栏下面。
+//! * 写失败不 panic：把编辑放回队里，把错误显示在顶栏下面，然后停下来
+//!   （不再排帧、不再自动重试）。再试一次的入口都是用户的动作：点"重试"、
+//!   再敲一个字、换日期或翻月份、关窗与锁定时的落盘。
 //!
 //! 密码只在这里出现一瞬（从视图取出来交给存储层），控制器自己不持有密钥。
 
 use crate::model::{Change, MonthKey, MonthSheet};
 use crate::store::{StoreError, Vault};
 use crate::ui::calendar::Calendar;
-use crate::ui::diary::{Diary, DiaryEvent};
-use crate::ui::shell::{self, Edge, ShellAction};
+use crate::ui::diary::{self, Diary, DiaryEvent};
+use crate::ui::shell::{self, Edge, SaveState, ShellAction};
 use crate::ui::theme;
 use crate::ui::unlock::{UnlockMode, UnlockView};
+use crate::window_state;
 use chrono::{Local, NaiveDate};
 use eframe::egui;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// 打字安静多久之后落盘
@@ -75,6 +79,19 @@ impl SaveScheduler {
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
+
+    /// 现在排下一帧有意义吗：队里有东西、而且上次没写失败。
+    ///
+    /// 返回 `false` 时排帧也不会发生任何写入（[`SaveScheduler::is_stuck`] 正是如此），
+    /// 调用方不要排帧——否则写失败会变成每 10 ms 一帧的空转。
+    pub fn needs_wakeup(&self) -> bool {
+        !self.pending.is_empty() && !self.stuck
+    }
+
+    /// 上次写失败过、编辑还压在队里：在用户点"重试"或下一次编辑之前，不自动重试。
+    pub fn is_stuck(&self) -> bool {
+        self.stuck
+    }
 }
 
 /// 界面现在停在哪一步
@@ -86,6 +103,23 @@ enum Stage {
     Unlock,
     /// 已解锁：主界面
     Ready,
+}
+
+/// 顶栏下面那条错误：一句话，加上它是怎么来的——决定它什么时候消失。
+#[derive(Clone, Debug)]
+enum Fault {
+    /// 写盘失败：跟着队列走，写成功就收掉；队列里还有东西时错误条给"重试"
+    Save(String),
+    /// 读盘失败、密码不对：与队列无关，留到用户点"知道了"
+    Other(String),
+}
+
+impl Fault {
+    fn message(&self) -> &str {
+        match self {
+            Self::Save(message) | Self::Other(message) => message,
+        }
+    }
 }
 
 /// 应用控制器
@@ -104,7 +138,9 @@ pub struct App {
     diary: Diary,
     scheduler: SaveScheduler,
     /// 最近一次失败，显示在顶栏下面
-    error: Option<String>,
+    error: Option<Fault>,
+    /// 窗口尺寸记忆的落盘位置；不设就完全不碰窗口状态（测试与嵌入式用法）
+    window_memory: Option<PathBuf>,
 }
 
 impl App {
@@ -129,7 +165,16 @@ impl App {
             diary: Diary::new(),
             scheduler: SaveScheduler::default(),
             error: None,
+            window_memory: None,
         })
+    }
+
+    /// 打开窗口尺寸记忆：关窗时把尺寸记到 `path`（见 [`crate::window_state`]）。
+    ///
+    /// 这是唯一开启它的入口；不开时一个字节都不会写到窗口状态文件。
+    pub fn with_window_memory(mut self, path: PathBuf) -> Self {
+        self.window_memory = Some(path);
+        self
     }
 
     /// 解锁成功之后进入主界面：读今天所在的那一页
@@ -151,92 +196,164 @@ impl App {
         self.sheet = match self.vault.load_month(key) {
             Ok(sheet) => sheet,
             Err(err) => {
-                self.error = Some(err.to_string());
+                self.error = Some(Fault::Other(err.to_string()));
                 MonthSheet::empty(key)
             }
         };
     }
 
-    /// 换页：先把旧页写完再读新页
+    /// 换页：先把旧页写完再读新页。
+    ///
+    /// 只从用户的动作里调（点日历上的日子、翻月份、点开某一行）。**不要放进每帧的绘制路径**：
+    /// 写失败时它每次都会再写一次盘，磁盘坏了就从"停下来"变成按帧写盘。
+    /// 写不成就只是不换页——编辑留在队里，用户的下一个动作会再试一次。
     fn switch_month(&mut self, key: MonthKey) {
         if key == self.month {
             return;
         }
         // 旧页上还没写的东西先落盘，否则换页会把它们从缓存里挤掉
-        if let Err(message) = self.flush() {
-            self.error = Some(message);
+        if !self.flush() {
             return;
         }
         self.load_month(key);
     }
 
-    /// 跳到某一天：日历跟着走，月份缓存按需换页
-    fn go_to(&mut self, date: NaiveDate) {
+    /// 跳到某一天：日历跟着走，月份缓存按需换页。
+    ///
+    /// 换页会先把旧页写完，写不成就不换页；`self.date` 与日历照样跳过去
+    /// ——跳是用户已经做过的动作，拦下来只会让三处状态互相不一致。
+    pub fn go_to(&mut self, date: NaiveDate) {
         self.date = date;
         self.calendar.select(date);
         self.switch_month(MonthKey::from_date(date));
     }
 
-    /// 把攒着的编辑写进去。失败时编辑不丢，留在队里等下次。
-    fn flush(&mut self) -> Result<(), String> {
+    /// 把攒着的编辑写进去。失败时编辑不丢，留在队里等下次，并把错误写进 `error`。
+    ///
+    /// 返回 `false` 表示这次没写成功：队列非空、[`SaveScheduler::is_stuck`] 为真。
+    /// 成功（或本来就没东西可写）返回 `true`，并收掉自己上一次留下的那条错误；
+    /// [`Fault::Other`]（读盘失败、密码不对）与队列无关，不在这里收。
+    fn flush(&mut self) -> bool {
         if self.scheduler.is_empty() {
-            return Ok(());
+            return true;
         }
         let changes = self.scheduler.take();
         match self.vault.apply(&changes) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // 只收写盘失败留下的那条：`load_month` 的读错误跟队列无关，
+                // 一次成功的写入不该让它消失（那一页其实还是空的兜底页）
+                if matches!(self.error, Some(Fault::Save(_))) {
+                    self.error = None;
+                }
+                true
+            }
             Err(err) => {
                 self.scheduler.requeue(changes);
-                Err(err.to_string())
+                self.error = Some(Fault::Save(err.to_string()));
+                false
             }
+        }
+    }
+
+    /// 用户点了错误条上的"重试"：立刻再写一次。
+    ///
+    /// 空队列是幂等的（什么都不做）。成功之后错误条消失、状态字回到"已保存"。
+    pub fn retry_save(&mut self) {
+        if self.scheduler.is_empty() {
+            return;
+        }
+        self.flush();
+    }
+
+    /// 顶栏那枚保存状态字该显示什么
+    fn save_state(&self) -> SaveState {
+        if self.scheduler.is_empty() {
+            SaveState::Saved
+        } else if self.scheduler.is_stuck() {
+            SaveState::Failed
+        } else {
+            SaveState::Pending
         }
     }
 
     /// 到点了就写
     fn flush_when_due(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
-        if self.scheduler.is_due(now)
-            && let Err(message) = self.flush()
-        {
-            self.error = Some(message);
+        if self.scheduler.is_due(now) {
+            self.flush();
         }
-        // 攒着东西就要保证还有下一帧，否则"到点"永远等不到
-        if !self.scheduler.is_empty() {
+        // 攒着东西就得保证还有下一帧，否则"到点"永远等不到；
+        // 上次写失败时不排帧——再排也不会写，只会空转
+        if self.scheduler.needs_wakeup() {
             let wait = self.scheduler.time_until_due(now).max(0.01);
             ctx.request_repaint_after(Duration::from_secs_f64(wait));
         }
     }
 
-    /// 关窗请求：先把攒着的东西写完，再放行
+    /// 关窗请求：先记下窗口尺寸，再把攒着的东西写完，最后放行。
     fn handle_close_request(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|i| i.viewport().close_requested()) || self.scheduler.is_empty() {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        // 尺寸与正文无关，有没有待写的编辑都要记
+        self.remember_window(ctx);
+        if self.scheduler.is_empty() {
             return;
         }
         // 还有没落盘的：先取消这次关闭
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        match self.flush() {
-            // 写完立刻再请求一次关闭
-            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        if !self.flush() {
             // 写不进去就别关，把错误留在屏幕上让人看见
-            Err(message) => self.error = Some(message),
+            return;
+        }
+        // 写完立刻再请求一次关闭
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// 把这一帧量到的窗口尺寸写进记忆文件。
+    ///
+    /// 没开记忆、或写不进去时只报一句——记不下尺寸不该影响关窗。
+    fn remember_window(&self, ctx: &egui::Context) {
+        let Some(path) = self.window_memory.as_deref() else {
+            return;
+        };
+        let (rect, maximized, fullscreen) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (
+                viewport.inner_rect,
+                viewport.maximized.unwrap_or(false),
+                viewport.fullscreen.unwrap_or(false),
+            )
+        });
+        // 最大化与全屏时量到的都是整屏尺寸，不能当作"普通尺寸"记下来。
+        // 全屏也要看：`maximized` 不是每帧都刷新（macOS 上 `egui_winit` 只在窗口创建
+        // 那一次采样它），而 macOS 那个绿色按钮给的正是全屏；`fullscreen` 每帧都更新。
+        let size = if maximized || fullscreen {
+            None
+        } else {
+            rect.map(|rect| (rect.width(), rect.height()))
+        };
+        if let Err(err) = window_state::remember(path, size, maximized) {
+            eprintln!("窗口尺寸记不下来：{err}");
         }
     }
 
-    /// 锁定：落盘之后才丢密钥
-    fn lock(&mut self) {
-        if let Err(message) = self.flush() {
-            // 没写进去的编辑不能就这么扔掉，先别锁
-            self.error = Some(message);
+    /// 锁定：落盘之后才丢密钥。
+    ///
+    /// 写不成就拒绝锁定并把错误留在屏幕上（编辑还在队里，不会丢）。
+    pub fn lock(&mut self, ctx: &egui::Context) {
+        if !self.flush() {
             return;
         }
         self.vault.lock();
         self.stage = Stage::Unlock;
         self.error = None;
-        // 锁上之后内存里也不留正文
+        // 锁上之后内存里也不留正文：缓存、视图状态，以及 `egui` 给输入框留下的那份副本
         self.sheet = MonthSheet::empty(self.month);
         self.diary = Diary::new();
         self.scheduler = SaveScheduler::default();
         self.unlock.clear();
+        diary::forget_text_edits(ctx);
     }
 
     /// 提交主密码
@@ -252,7 +369,7 @@ impl App {
         match outcome {
             Ok(()) => self.enter_ready(),
             Err(err) => {
-                self.error = Some(err.to_string());
+                self.error = Some(Fault::Other(err.to_string()));
                 // 输入框清掉：错的密码不该留在屏幕上
                 self.unlock.clear();
             }
@@ -277,10 +394,9 @@ impl App {
         if let Some(date) = event.activated {
             self.go_to(date);
         }
-        if (event.immediate || event.blurred)
-            && let Err(message) = self.flush()
-        {
-            self.error = Some(message);
+        // 离散动作（删除、撤销）与离开一行都立刻写
+        if event.immediate || event.blurred {
+            self.flush();
         }
     }
 
@@ -290,7 +406,7 @@ impl App {
             Stage::Setup => UnlockMode::Setup,
             _ => UnlockMode::Unlock,
         };
-        let error = self.error.clone();
+        let error = self.error.as_ref().map(|fault| fault.message().to_owned());
         let mut submitted = false;
 
         egui::CentralPanel::default()
@@ -308,9 +424,6 @@ impl App {
     fn diary_screen(&mut self, ui: &mut egui::Ui) {
         let today = Local::now().date_naive();
 
-        // 日历翻页了就把缓存换过来（点 ‹/› 只动日历，不动选中的日子）
-        self.switch_month(self.calendar.displayed_month());
-
         let mut action = ShellAction::default();
 
         // ── 顶栏 ──
@@ -323,12 +436,15 @@ impl App {
                     .fill(theme::SURFACE)
                     .inner_margin(egui::Margin::symmetric(shell::panel_padding_x(), 0)),
             )
-            .show(ui, |ui| shell::top_bar(ui, self.date, today));
+            .show(ui, |ui| {
+                shell::top_bar(ui, self.date, today, self.save_state())
+            });
         shell::edge_line(ui, bar.response.rect, Edge::Bottom);
         action = action.merge(bar.inner);
 
         // ── 错误条 ──
-        if let Some(message) = self.error.clone() {
+        if let Some(fault) = self.error.clone() {
+            let retryable = self.scheduler.is_stuck();
             let bar = egui::Panel::top("error_bar")
                 .exact_size(shell::error_bar_height())
                 .resizable(false)
@@ -338,10 +454,13 @@ impl App {
                         .fill(theme::RED_BG)
                         .inner_margin(egui::Margin::symmetric(shell::panel_padding_x(), 0)),
                 )
-                .show(ui, |ui| shell::error_banner(ui, &message));
+                .show(ui, |ui| shell::error_banner(ui, fault.message(), retryable));
             shell::edge_line(ui, bar.response.rect, Edge::Bottom);
-            if bar.inner {
+            if bar.inner.dismissed {
                 self.error = None;
+            }
+            if bar.inner.retry {
+                self.retry_save();
             }
         }
 
@@ -359,10 +478,9 @@ impl App {
         shell::edge_line(ui, bar.response.rect, Edge::Top);
 
         // ── 侧栏：日历 ──
-        let (month, written, date, marked, calendar) = (
+        let (month, written, marked, calendar) = (
             self.month,
             self.sheet.len(),
-            self.date,
             self.sheet.marked(),
             &mut self.calendar,
         );
@@ -385,16 +503,23 @@ impl App {
                     egui::Color32::from_rgba_unmultiplied(0xD8, 0xC7, 0x9E, 16),
                 );
 
+                let before = calendar.displayed_month();
                 let picked = calendar.show(ui, &marked);
-                let footer = shell::sidebar_footer(ui, month, written, date, today);
-                (picked, footer)
+                // 页脚只有本月记录与进度条：回到今天在顶栏那枚，不在左下角重复
+                shell::sidebar_footer(ui, month, written);
+                // 翻页键与跨月的日子都在 `show` 里改日历自己那个月：
+                // 这一帧翻没翻，只有在里面比过才知道
+                (picked, calendar.displayed_month() != before)
             });
         shell::edge_line(ui, bar.response.rect, Edge::Right);
 
-        let (picked, footer) = bar.inner;
-        action = action.merge(footer);
+        let (picked, turned) = bar.inner;
         if let Some(date) = picked {
+            // 点中的日子可能不在本月：换页交给 `go_to`（它先把旧页写完）
             self.go_to(date);
+        } else if turned {
+            // 只有用户翻了页才换页：每帧都试一次会让写失败变成按帧写盘
+            self.switch_month(self.calendar.displayed_month());
         }
 
         // ── 正文 ──
@@ -435,7 +560,7 @@ impl App {
             self.go_to(today);
         }
         if action.lock {
-            self.lock();
+            self.lock(ui.ctx());
         }
     }
 }

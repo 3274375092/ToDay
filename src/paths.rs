@@ -24,6 +24,11 @@ pub fn database_path() -> Result<PathBuf, PathError> {
     Ok(data_dir()?.join("today.db"))
 }
 
+/// 窗口尺寸记忆文件（见 [`crate::window_state`]）
+pub fn window_state_path() -> Result<PathBuf, PathError> {
+    Ok(data_dir()?.join("window.txt"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -34,5 +39,13 @@ mod tests {
         let db = database_path().unwrap();
         assert_eq!(db.parent(), Some(dir.as_path()));
         assert_eq!(db.file_name().unwrap(), "today.db");
+    }
+
+    #[test]
+    fn window_state_file_lives_under_the_data_dir() {
+        let dir = data_dir().unwrap();
+        let window = window_state_path().unwrap();
+        assert_eq!(window.parent(), Some(dir.as_path()));
+        assert_eq!(window.file_name().unwrap(), "window.txt");
     }
 }

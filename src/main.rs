@@ -6,8 +6,10 @@
 use ToDay::app::App;
 use ToDay::store::sqlite::SqliteVault;
 use ToDay::ui::theme;
+use ToDay::window_state;
 use anyhow::Context as _;
 use eframe::egui;
+use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetupCreateNew, wgpu};
 
 fn main() -> anyhow::Result<()> {
     let path = ToDay::paths::database_path().context("找不到应用数据目录")?;
@@ -15,12 +17,29 @@ fn main() -> anyhow::Result<()> {
         SqliteVault::open(&path).with_context(|| format!("打不开数据库 {}", path.display()))?;
     let app = App::new(Box::new(vault)).context("日记本初始化失败")?;
 
+    // 上一次的窗口尺寸；文件坏了就按默认来
+    let window_path = ToDay::paths::window_state_path().context("找不到应用数据目录")?;
+    let window = window_state::load(&window_path).unwrap_or_default();
+    let app = app.with_window_memory(window_path);
+
+    // 适配器偏好默认低功耗：日记本不该把独显叫醒。`WGPU_POWER_PREF=high` 仍可覆盖
+    let mut setup = WgpuSetupCreateNew::without_display_handle();
+    setup.power_preference =
+        wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::LowPower);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 660.0])
-            .with_min_inner_size([720.0, 480.0])
+            .with_inner_size([window.size.0, window.size.1])
+            .with_min_inner_size([window_state::MIN_SIZE.0, window_state::MIN_SIZE.1])
+            .with_maximized(window.maximized)
             .with_title("ToDay"),
-        multisampling: 4,
+        // 关掉 MSAA：圆角与细线由 `epaint` 自己做 1px feathering，
+        // 4× 只会让 wgpu 多建一个 4 倍大的采样目标、每帧多一次 resolve
+        multisampling: 0,
+        wgpu_options: WgpuConfiguration {
+            wgpu_setup: setup.into(),
+            ..Default::default()
+        },
         ..Default::default()
     };
 

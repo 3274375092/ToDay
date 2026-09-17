@@ -7,6 +7,7 @@ use egui::{
     Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Galley, Margin,
     Mesh, Pos2, Rect, RichText, Shape, Stroke, StrokeKind, TextStyle, Ui, Vec2,
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 // ────────────────────────────── 色板 ──────────────────────────────
@@ -134,37 +135,55 @@ pub fn mono(size: f32) -> FontId {
 }
 
 /// 按候选路径顺序读字体文件，读到的第一个作为该角色注册。
-fn load_role(fonts: &mut FontDefinitions, key: &str, candidates: &[&str]) -> Vec<String> {
+///
+/// `loaded` 是这一轮已经装过的文件：路径 → `font_data` 里的键名。同一个文件被两个角色
+/// 选中时（比如中文无衬线那里），第二次直接复用那个键，不再读一遍、也不再存一份。
+/// 候选路径全部不存在时返回空列表，这个角色就只剩 `egui` 自带的兜底字体。
+fn load_role(
+    fonts: &mut FontDefinitions,
+    loaded: &mut BTreeMap<String, String>,
+    key: &str,
+    candidates: &[&str],
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Vec<String> {
     for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Some(existing) = loaded.get(*path) {
+            return vec![existing.clone()];
+        }
+        if let Some(bytes) = read(path) {
             fonts
                 .font_data
                 .insert(key.to_owned(), FontData::from_owned(bytes).into());
+            loaded.insert((*path).to_owned(), key.to_owned());
             return vec![key.to_owned()];
         }
     }
     Vec::new()
 }
 
-/// 装字体：挑中的字体排在最前，egui 自带的留在后面兜底。
-pub fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
+/// 把三套角色的候选路径解成 `font_data` 与 `families`，返回中文无衬线装上了没有。
+///
+/// `read` 注入进来是为了单测数得清同一个文件被读了几次。
+fn build_fonts(fonts: &mut FontDefinitions, read: &dyn Fn(&str) -> Option<Vec<u8>>) -> bool {
+    let mut loaded: BTreeMap<String, String> = BTreeMap::new();
 
-    let mut sans = load_role(&mut fonts, "sans", SANS_LATIN);
-    sans.extend(load_role(&mut fonts, "sans-cjk", CJK_SANS));
+    let mut sans = load_role(fonts, &mut loaded, "sans", SANS_LATIN, read);
+    sans.extend(load_role(fonts, &mut loaded, "sans-cjk", CJK_SANS, read));
 
-    let mut sans_bold = load_role(&mut fonts, "sans-bold", SANS_BOLD_LATIN);
-    sans_bold.extend(load_role(&mut fonts, "sans-bold-cjk", CJK_SANS_BOLD));
+    let mut sans_bold = load_role(fonts, &mut loaded, "sans-bold", SANS_BOLD_LATIN, read);
+    sans_bold.extend(load_role(
+        fonts,
+        &mut loaded,
+        "sans-bold-cjk",
+        CJK_SANS_BOLD,
+        read,
+    ));
 
-    let mut serif = load_role(&mut fonts, "serif", SERIF_LATIN);
-    serif.extend(load_role(&mut fonts, "serif-cjk", CJK_SERIF));
+    let mut serif = load_role(fonts, &mut loaded, "serif", SERIF_LATIN, read);
+    serif.extend(load_role(fonts, &mut loaded, "serif-cjk", CJK_SERIF, read));
 
-    let mut mono = load_role(&mut fonts, "mono", MONO);
-    mono.extend(load_role(&mut fonts, "mono-cjk", CJK_SANS));
-
-    if !sans.iter().any(|key| key.ends_with("cjk")) {
-        eprintln!("未找到中文字体文件，中文可能显示为方块");
-    }
+    let mut mono = load_role(fonts, &mut loaded, "mono", MONO, read);
+    mono.extend(load_role(fonts, &mut loaded, "mono-cjk", CJK_SANS, read));
 
     for (family, keys) in [
         (FontFamily::Proportional, sans),
@@ -183,6 +202,19 @@ pub fn install_fonts(ctx: &egui::Context) {
         if !keys.is_empty() {
             fonts.families.insert(family, keys);
         }
+    }
+
+    // 中文排不上号时 egui 只能拿自带字体兜底，中文会变成方块
+    fonts.font_data.contains_key("sans-cjk")
+}
+
+/// 装字体：挑中的字体排在最前，egui 自带的留在后面兜底。
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    let read = |path: &str| std::fs::read(path).ok();
+
+    if !build_fonts(&mut fonts, &read) {
+        eprintln!("未找到中文字体文件，中文可能显示为方块");
     }
 
     ctx.set_fonts(fonts);
@@ -338,7 +370,7 @@ fn tracked(ui: &Ui, text: &str, font: FontId, tracking: f32) -> Arc<Galley> {
 
 /// 一条 galley 的基线离它的顶边多远：第一行的第一个字形落在哪。
 ///
-/// `egui` 不直接给这个数，而按基线摆文字恰恰需要它（见 [`line`]）；
+/// `egui` 不直接给这个数，而按基线摆文字恰恰需要它（见 [`line()`]）；
 /// 日记的装订线也要靠它跟正文压到同一条线上。
 pub(crate) fn baseline(galley: &Galley) -> f32 {
     galley.rows.first().map_or(0.0, |row| {
@@ -611,7 +643,7 @@ pub fn line(ui: &mut Ui, edge: Edge, pieces: &[Piece<'_>]) -> Vec<egui::Response
 
 /// 中英混排的一行文字：拉丁与中文各自成段，压在同一条基线上。
 ///
-/// 等于把 [`mixed_pieces`] 交给 [`line`]（贴左，只占自己那点宽度）；
+/// 等于把 [`mixed_pieces`] 交给 [`line()`]（贴左，只占自己那点宽度）；
 /// 正文里的 `年 / 月 / 日`、日期戳这类标签用它替代 `ui.label`。
 pub fn mixed(ui: &mut Ui, text: &str, font: FontId, color: Color32) {
     line(ui, Edge::Inline, &mixed_pieces(text, font, color));
@@ -620,7 +652,7 @@ pub fn mixed(ui: &mut Ui, text: &str, font: FontId, color: Color32) {
 /// 把一段文本切成若干段：连续的中文归一段，其余（数字、英文、空格、标点）归另一段。
 ///
 /// 段与段之间不留空隙——间隙来自文本里的空格，切段本身不改变排版。
-/// 需要和键帽、分隔线拼成一行时，用 [`line`] 把切出来的段接在后面。
+/// 需要和键帽、分隔线拼成一行时，用 [`line()`] 把切出来的段接在后面。
 pub fn mixed_pieces<'a>(text: &'a str, font: FontId, color: Color32) -> Vec<Piece<'a>> {
     let mut pieces: Vec<Piece<'a>> = Vec::new();
     let mut start = 0;
@@ -671,8 +703,8 @@ fn is_cjk(ch: char) -> bool {
 
 /// 只能文字的小按钮：平时看不见，悬停时浮出一层暖色。
 ///
-/// 就是 [`Piece::button`] 单独摆一行（见 [`line`]）；要和别的文字拼成一行时，
-/// 直接把它放进 [`line`]，免得基线对不上。
+/// 就是 [`Piece::button`] 单独摆一行（见 [`line()`]）；要和别的文字拼成一行时，
+/// 直接把它放进 [`line()`]，免得基线对不上。
 pub fn ghost_button(ui: &mut Ui, text: &str) -> egui::Response {
     line(ui, Edge::Inline, &[Piece::button(text)])
         .pop()
@@ -816,6 +848,7 @@ mod tests {
                 &[
                     Piece::text("15", mono(14.0), INK),
                     Piece::text("二", sans(10.0), FAINT).gap(4.0),
+                    Piece::state("已保存", MUTED).gap(10.0),
                     Piece::key("Enter").gap(10.0),
                     Piece::text("你打包", sans(15.5), INK).gap(10.0),
                     Piece::divider().gap(10.0),
@@ -824,12 +857,49 @@ mod tests {
             );
         });
 
-        assert_eq!(found.len(), 5, "五段文字都该画出来，分隔线不算：{found:?}");
+        assert_eq!(found.len(), 6, "六段文字都该画出来，分隔线不算：{found:?}");
         for (index, y) in found.iter().enumerate() {
             assert!(
                 (y - found[0]).abs() < 0.01,
                 "第 {index} 段没压在同一条基线上：{found:?}"
             );
         }
+    }
+
+    /// 同一个文件被两个角色选中时只读一次、只存一份：`msyh.ttc` 一份就是 19 MB。
+    ///
+    /// 假读取器只认中文无衬线的第一个候选路径，所以两个角色都会选中它。
+    #[test]
+    fn a_font_file_shared_by_two_roles_is_read_once() {
+        let mut fonts = FontDefinitions::default();
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |path: &str| {
+            reads.borrow_mut().push(path.to_owned());
+            (path == CJK_SANS[0]).then(|| path.as_bytes().to_vec())
+        };
+
+        assert!(build_fonts(&mut fonts, &read), "中文那套该算装上了");
+        // 其他候选路径都是"探一下、不存在"，只有真的读到的那个才会存进来
+        assert_eq!(
+            reads
+                .borrow()
+                .iter()
+                .filter(|path| path.as_str() == CJK_SANS[0])
+                .count(),
+            1,
+            "同一个文件只读一遍：{:?}",
+            reads.borrow()
+        );
+        assert!(fonts.font_data.contains_key("sans-cjk"));
+        assert!(
+            !fonts.font_data.contains_key("mono-cjk"),
+            "去重之后不能再多一个键"
+        );
+        assert_eq!(fonts.families[&FontFamily::Proportional][0], "sans-cjk");
+        assert_eq!(
+            fonts.families[&FontFamily::Monospace][0],
+            "sans-cjk",
+            "等宽的回退链复用同一份中文字体"
+        );
     }
 }

@@ -101,7 +101,11 @@ impl UnlockView {
                             false,
                         ));
                     }
-                    self.focus_pending = false;
+                    // eframe 把窗口藏着建、第一帧画完才显形：还没显形时窗口收不到键盘
+                    // （`has_focus` 为假），这一帧就别把"下次聚焦"用掉，等真能敲键盘再落实
+                    if ui.ctx().input(|i| i.focused) {
+                        self.focus_pending = false;
+                    }
 
                     // 回车提交：单行输入框按回车会失焦，顺势当作"提交"
                     let entered = ui.input(|i| i.key_pressed(egui::Key::Enter));

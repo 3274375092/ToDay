@@ -1,0 +1,65 @@
+# CI：把 AGENTS.md §5 的三条门禁搬到机器上，外加 rustdoc 与 release 构建。
+#
+# 只有 Windows：`%APPDATA%`、`msyh.ttc`、Consolas 都是这条线上的，
+# 本地门禁也在这里跑。README 里写的 macOS / Linux 路径没有 CI 覆盖。
+---
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上新的推送取消上一轮没跑完的，省 runner 时间
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: 门禁
+    runs-on: windows-latest
+    # 留足余量：依赖按 Cargo.toml 的 profile 开 opt-level = 3，
+    # 缓存空的时候要连 rusqlite 的 bundled SQLite 一起重编
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # 不钉小版本：本地用的是 stable，CI 跟着走
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 缓存 ~/.cargo 与 target/：改自己的代码时不重编依赖
+      - uses: Swatinem/rust-cache@v2
+
+      # 便宜的先跑：红了就不用等后面的
+      - name: 格式
+        run: cargo fmt --check
+
+      - name: 静态检查
+        # 警告按错误算：AGENTS.md 说 clippy 是干净基线，这是要求不是建议。
+        # 代价摆在明处：新 stable 带回新 lint 时这一步会红，得跟一次代码。
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 测试
+        run: cargo test
+
+      - name: 文档
+        # AGENTS.md 说 rustdoc 目前没有机器门禁（missing_docs 未开）。
+        # -D warnings 只卡能机器判定的那部分：坏掉的 intra-doc 链接算失败。
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
+
+      - name: release 构建
+        # 验证 `[profile.release]` 那套（lto = "thin"、codegen-units = 1、strip = true）
+        # 能编出产物；不传 artifact，这里只要"编得过"
+        run: cargo build --release
