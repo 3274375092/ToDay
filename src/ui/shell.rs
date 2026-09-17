@@ -89,7 +89,7 @@ pub fn top_bar(ui: &mut Ui, date: NaiveDate, today: NaiveDate) -> ShellAction {
             theme::Edge::Inline,
             &[
                 theme::Piece::text("ToDay", theme::display(20.0), theme::INK_DEEP),
-                theme::Piece::text("一天一行", theme::sans(11.5), theme::FAINT).gap(12.0),
+                theme::Piece::text("一日一记", theme::sans(11.5), theme::FAINT).gap(12.0),
             ],
         );
 
@@ -228,7 +228,7 @@ pub fn wordmark(ui: &mut Ui) {
         );
         ui.add_space(4.0);
         ui.label(
-            RichText::new("一天一行")
+            RichText::new("一日一记")
                 .font(theme::sans(11.5))
                 .color(theme::FAINT),
         );
