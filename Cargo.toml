@@ -1,0 +1,29 @@
+[package]
+name = "ToDay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 界面：eframe 起窗口，egui 画界面（ui 层只依赖后者）
+eframe = "0.36.2"
+egui = "0.36.2"
+
+# 加密：Argon2id 派生密钥，ChaCha20-Poly1305 逐字段加密
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = "1.9"
+rand = "0.8"
+
+# 存储：bundled 自带 SQLite 源码，不依赖系统里装没装
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 日期与平台路径
+chrono = "0.4"
+directories = "6"
+
+# 错误：库层用 thiserror，只有 main 汇报错误用 anyhow
+thiserror = "2"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
