@@ -63,3 +63,46 @@ jobs:
         # 验证 `[profile.release]` 那套（lto = "thin"、codegen-units = 1、strip = true）
         # 能编出产物；不传 artifact，这里只要"编得过"
         run: cargo build --release
+
+  android:
+    # 桌面那三道门禁碰不到 `#[cfg(target_os = "android")]` 的代码（android.rs、paths 的
+    # set_data_dir、eframe 的 android feature……），这一条是唯一会编它们的守卫。
+    # 不跑测试、也不打 APK：手机上才跑得起来的断言在 tests/ 里，APK 由本地脚本出。
+    name: Android 编译
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # 与 gate 分开：两条线的 target 与 target-triple 都不一样
+          key: android
+
+      - name: 装 NDK
+        # 版本钉死（与 docs/android.md 的工具链表同一个）：NDK 换了，
+        # `android-activity` 自己那份 C++ glue 的编译结果就会变
+        env:
+          NDK_VERSION: 27.0.12077973
+        shell: pwsh
+        run: |
+          $sdkmanager = "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat"
+          & $sdkmanager "ndk;$env:NDK_VERSION"
+          # cargo-ndk 认这三个里的任意一个
+          "ANDROID_NDK_HOME=$env:ANDROID_HOME\ndk\$env:NDK_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: 装 cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: 编 arm64 的 .so
+        # `--lib` 只编 cdylib（桌面那个 bin 在 Android 上没有入口）；
+        # 产物落进 jniLibs，与 scripts/build-android.ps1 的第一步一致
+        run: cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --lib
+
+      - name: 静态检查（Android 目标）
+        # 同一个 `-D warnings` 口径，但这次编的是 android cfg 那一支
+        run: cargo ndk -t arm64-v8a clippy --lib -- -D warnings

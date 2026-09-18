@@ -207,7 +207,8 @@ pub fn top_bar(ui: &mut Ui, date: NaiveDate, today: NaiveDate, state: SaveState)
 }
 
 /// 底栏：本月统计在左，键位提示在右
-pub fn status_bar(ui: &mut Ui, month: MonthKey, written: usize) {    ui.horizontal_centered(|ui| {
+pub fn status_bar(ui: &mut Ui, month: MonthKey, written: usize) {
+    ui.horizontal_centered(|ui| {
         theme::mixed(
             ui,
             &format!(

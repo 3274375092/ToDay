@@ -16,7 +16,7 @@ pub enum PathError {
     /// Android 的 app 私有目录没指定：没有它就没有可写的地方，只能不启动
     #[error("拿不到应用私有目录")]
     NoAppDir,
-    /// [`set_data_dir`] 只该被调一次；再调说明有两处入口在抢同一个进程
+    /// `set_data_dir` 只该被调一次（Android）；再调说明有两处入口在抢同一个进程
     #[error("本进程的数据目录已经定过了")]
     AlreadySet,
 }
@@ -95,7 +95,10 @@ mod tests {
     fn an_explicit_directory_wins_over_the_platform_default() {
         let dir = std::path::Path::new("D:/tmp/一个数据目录");
         assert_eq!(resolve(Some(dir)).unwrap(), dir);
-        assert_eq!(resolve(Some(dir)).unwrap().join("today.db"), dir.join("today.db"));
+        assert_eq!(
+            resolve(Some(dir)).unwrap().join("today.db"),
+            dir.join("today.db")
+        );
     }
 
     /// 没指定时仍然走 `directories`：桌面语义一点没变

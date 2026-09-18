@@ -10,7 +10,8 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 编译与打包 | 本机验证过：`scripts/build-android.ps1` 出 `app-debug.apk` |
+| 编译与打包 | 本机验证过：`cargo ndk` + `gradlew assembleDebug` 出 `app-debug.apk`（16.2 MB；`lib/arm64-v8a/libToDay.so` 与两个 dex 都在包里，manifest 合并结果里的包名 / Activity / `lib_name` / `allowBackup=false` / `adjustResize` 都对了） |
+| 静态检查 | 本机验证过：`cargo ndk -t arm64-v8a clippy --lib -- -D warnings` 与 `RUSTDOCFLAGS=-D warnings cargo ndk -t arm64-v8a doc --no-deps` 都干净 |
 | 装机、真机行为 | **没有验证过**：写这份文档的机器上没有真机。`adb install` 与下面那份"真机验收清单"要有人跑一遍才算 |
 | 中文（拼音）输入 | **待定**：winit 0.30.13 的 Android 后端只处理 `MotionEvent` / `KeyEvent`，不消费 game-activity 的 `TextEvent`（源码 `platform_impl/android/mod.rs` 里 `InputEvent` 只认前两者）。它只从 `KeyCharacterMap` 反查按键字符，而输入法的合成文本不走这条路 —— 所以拼音候选上屏**很可能收不到**。真机的结论决定要不要做 JNI 桥，见下面"中文输入" |
 
@@ -58,6 +59,24 @@ cd android && ./gradlew assembleDebug          # Windows: gradlew.bat
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 adb logcat -s ToDay          # 应用自己的日志；eframe / wgpu 的日志是别的 tag
 ```
+
+装之前可以先看看包里到底装了什么（不依赖真机）：
+
+```bash
+unzip -l android/app/build/outputs/apk/debug/app-debug.apk | grep -E "lib/|classes"
+"$ANDROID_HOME/build-tools/35.0.0/aapt2.exe" dump badging <apk>     # 包名 / minSdk / targetSdk / label
+```
+
+## 构建上踩过的两个坑
+
+**1. `kotlin-stdlib` 重复类（`checkDebugDuplicateClasses` 卡停构建）。**
+`kotlin-stdlib-jdk7/jdk8` 从 Kotlin 1.8 起就是空壳（内容并进了 `kotlin-stdlib`），而 appcompat 那条链
+（`lifecycle` → `kotlinx-coroutines-android` → `kotlin-stdlib-jdk8:1.6.21`）与 games-activity 都还引着那两个
+独立构件，与 `kotlin-stdlib:1.8.22` 同时在场就是重复类。`android/app/build.gradle.kts` 里把这两个模块
+在所有 configuration 上排掉了；升级 appcompat / games-activity 时如果这个报错又回来，先看这一条。
+
+**2. `cargo ndk build` 要带 `--lib`。**
+不带它 cargo 还会去编桌面那个 bin（`src/main.rs`）——Android 上没有它的入口，白编一遍还多一个链接目标。
 
 ## 数据在哪
 

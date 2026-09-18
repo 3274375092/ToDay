@@ -35,6 +35,16 @@ android {
     }
 }
 
+// Kotlin 1.8 起 `kotlin-stdlib-jdk7/jdk8` 就是空壳（内容并进了 `kotlin-stdlib`），
+// 而 appcompat 那条链（lifecycle → kotlinx-coroutines → ）与 games-activity 都还引着 1.6.21 的
+// 两个独立构件：它们与 `kotlin-stdlib` 1.8.22 同时在场就是“重复类”，
+// `checkDebugDuplicateClasses` 会直接卡停构建。两个构件在这里一次排干净；
+// 真正的字节码在 `kotlin-stdlib` 里一个不少。
+configurations.configureEach {
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk7")
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")
+}
+
 dependencies {
     // GameActivity 的 Java 壳（manifest 里那个 Activity 类）；C++ glue 由 android-activity 自己带，
     // 所以**不要**打开 prefab（见 android-activity 的 README）

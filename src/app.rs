@@ -804,27 +804,26 @@ impl App {
         // ── 底栏 ──
         // 窄屏那条要放三枚 44pt 的按钮，比宽屏高；左右内边距也收窄一点，给按钮让位
         let next = self.next_day();
-        let bar = egui::Panel::bottom("status_bar")
-            .exact_size(if narrow {
-                shell::MOBILE_STATUS_BAR_HEIGHT
-            } else {
-                shell::STATUS_BAR_HEIGHT
-            })
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::NONE.fill(theme::SURFACE).inner_margin(
-                    egui::Margin::symmetric(if narrow { 12 } else { shell::panel_padding_x() }, 0),
-                ),
-            )
-            .show(ui, |ui| {
-                if narrow {
-                    shell::mobile_status_bar(ui, self.sheet.len(), next)
+        let bar =
+            egui::Panel::bottom("status_bar")
+                .exact_size(if narrow {
+                    shell::MOBILE_STATUS_BAR_HEIGHT
                 } else {
-                    shell::status_bar(ui, self.month, self.sheet.len());
-                    ShellAction::default()
-                }
-            });
+                    shell::STATUS_BAR_HEIGHT
+                })
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE.fill(theme::SURFACE).inner_margin(
+                    egui::Margin::symmetric(if narrow { 12 } else { shell::panel_padding_x() }, 0),
+                ))
+                .show(ui, |ui| {
+                    if narrow {
+                        shell::mobile_status_bar(ui, self.sheet.len(), next)
+                    } else {
+                        shell::status_bar(ui, self.month, self.sheet.len());
+                        ShellAction::default()
+                    }
+                });
         shell::edge_line(ui, bar.response.rect, Edge::Top);
         action = action.merge(bar.inner);
 

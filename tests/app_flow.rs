@@ -1614,7 +1614,11 @@ fn the_back_key_unwinds_one_layer_at_a_time() {
         &mut app,
         narrow_frame(0.85).focused_on(field).text("咖啡"),
     );
-    let shown = texts(&run_output(&ctx, &mut app, narrow_frame(1.2).focused_on(field)));
+    let shown = texts(&run_output(
+        &ctx,
+        &mut app,
+        narrow_frame(1.2).focused_on(field),
+    ));
     assert!(shown.contains("找到 1 天"), "防抖之后该列出命中：{shown}");
 
     // 第一下：收浮层（查询与命中都留着）
@@ -1677,4 +1681,3 @@ fn going_to_the_background_writes_the_pending_edits() {
     // egui 手里还有一份正文，它绝不能进 `app.ron`
     assert!(!eframe::App::persist_egui_memory(&app));
 }
-

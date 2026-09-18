@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   一条命令出 APK：先 cargo ndk 把 libToDay.so 编进 jniLibs，再交给 Gradle 打包。
 
@@ -16,6 +16,8 @@
   pwsh scripts/build-android.ps1 -Abi x86_64      # 模拟器
   pwsh scripts/build-android.ps1 -Release         # release 的 .so 与 APK
 #>
+# 注意：本文件存为 UTF-8 **带 BOM**。Windows PowerShell 5.1 不带 BOM 时会按 GBK 读，
+# 中文注释的字节会吃进引号，整个脚本报语法错（改完记得用带 BOM 的方式存回去）。
 param(
     [ValidateSet("arm64-v8a", "x86_64")]
     [string]$Abi = "arm64-v8a",
