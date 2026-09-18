@@ -1865,6 +1865,66 @@ fn ime_injections_report_whether_something_was_committed() {
     );
 }
 
+/// 同一帧里键盘的退格与快照变短同时出现时按**条数**合并，不是"有键盘退格就一次都不补"。
+///
+/// 输入法整词删两个字、winit 只报了一次按键时，不补那一次就与快照差一个字；
+/// 而基准已经推到新快照，差出来的这个字不会自己回来。
+#[test]
+fn keyboard_backspaces_cover_only_their_own_share_of_the_snapshot() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, _spy) = fake_app();
+
+    // 基准先推到四个字
+    app.apply_ime_snapshot(&mut egui::RawInput::default(), "一二三四", None);
+
+    let backspaces = |input: &egui::RawInput| {
+        input
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::Key {
+                        key: Key::Backspace,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+
+    // 快照少了 2 个字，这一帧的键盘事件只带了 1 次退格：还欠 1 次
+    let mut input = egui::RawInput {
+        events: vec![key_event(Key::Backspace, egui::Modifiers::default())],
+        ..Default::default()
+    };
+    app.apply_ime_snapshot(&mut input, "一二", None);
+    assert_eq!(
+        backspaces(&input),
+        2,
+        "键盘那一次 + 补上的那一次：{:?}",
+        input.events
+    );
+
+    // 快照只少了 1 个字而键盘报了 2 次：一次都不补，不能删成三个
+    let mut input = egui::RawInput {
+        events: vec![
+            key_event(Key::Backspace, egui::Modifiers::default()),
+            key_event(Key::Backspace, egui::Modifiers::default()),
+        ],
+        ..Default::default()
+    };
+    app.apply_ime_snapshot(&mut input, "一", None);
+    assert_eq!(
+        backspaces(&input),
+        2,
+        "键盘那两次已经够了：{:?}",
+        input.events
+    );
+}
+
 /// 装上排帧回调，返回它看到的那些延迟。
 ///
 /// `eframe` 真实运行时用的就是它（回调里按 `delay` 排一次 `UserEvent::RequestRepaint`），
@@ -1937,7 +1997,7 @@ fn ime_typing_requests_another_frame_right_away() {
     );
 }
 
-/// 没有输入框在焦点上时不排帧：空闲一帧都不多画（与接手前一致）。
+/// 没有输入框在焦点上时不排帧：空闲一帧都不多画。
 ///
 /// 快照照样每帧喂（Android 那条路也是）：基准 `ime_committed` 要保持新鲜，否则重新聚焦时
 /// 会把整段旧正文重新倒进输入框——不排帧 ≠ 不读快照。

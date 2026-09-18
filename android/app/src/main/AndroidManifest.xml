@@ -25,9 +25,13 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@style/AppTheme">
 
+        <!-- `configChanges` 里没列的变更会让系统重建 Activity，而重建就是同一个进程里第二次
+             `android_main`：winit 的 `EventLoop` 一个进程只能建一次，那次只会失败
+             （见 docs/android.md 的"返回键与退出"）。界面是 egui 自己画的、字号与语言都不跟
+             系统走，所以这几项声明成"应用自己处理"：系统不重建，界面也确实不需要变。 -->
         <activity
             android:name="com.google.androidgamesdk.GameActivity"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|density|uiMode"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|density|uiMode|fontScale|locale|layoutDirection"
             android:exported="true"
             android:launchMode="singleTask"
             android:theme="@style/AppTheme"

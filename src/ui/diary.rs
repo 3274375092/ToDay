@@ -1008,7 +1008,7 @@ mod tests {
         );
         assert!(!shown.contains("的日记「"), "窄屏放不下正文摘要：{shown}");
 
-        // 宽屏：位置与文案与窄屏改动之前逐值相同（底栏 30 + 12 缝），摘要还在
+        // 宽屏：偏移是宽屏底栏 30 + 12 缝 = 42pt，摘要还在
         let (rect, shown) = toast_frame(&ctx, &mut diary, shell::Chrome::of(false));
         assert!(
             (800.0 - rect.bottom() - 42.0).abs() < 0.01,

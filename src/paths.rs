@@ -16,8 +16,8 @@ pub enum PathError {
     /// Android 的 app 私有目录没指定：没有它就没有可写的地方，只能不启动
     #[error("拿不到应用私有目录")]
     NoAppDir,
-    /// `set_data_dir` 只该被调一次（Android）；再调说明有两处入口在抢同一个进程
-    #[error("本进程的数据目录已经定过了")]
+    /// `set_data_dir` 想指定成另一个目录（Android）：同一个进程里只能有一个库路径
+    #[error("本进程的数据目录已经定成了别的路径")]
     AlreadySet,
 }
 
@@ -53,11 +53,33 @@ pub fn data_dir() -> Result<PathBuf, PathError> {
 /// 指定本进程的数据目录，在这之后 [`data_dir`] 都返回它。
 ///
 /// 只在 Android 上有：那边的私有目录 `/data/user/0/<包名>/files` 只有 `AndroidApp` 知道。
-/// 幂等性：**只允许调一次**，第二次返回 [`PathError::AlreadySet`]，绝不悄悄换成另一个目录——
-/// 同一个进程里出现两个库路径会变成"写完看不见"。
+///
+/// 幂等性：**同一个目录可以重复指定**——`android-activity` 会在同一个进程里再调一次
+/// `android_main`（Activity 重建、退出后重开都是），那时拿到的是同一个私有目录，
+/// 这一步必须放行，否则界面根本不会起来。指定成另一个目录返回 [`PathError::AlreadySet`]，
+/// 绝不悄悄换掉：同一个进程里出现两个库路径会变成"写完看不见"。
 #[cfg(target_os = "android")]
 pub fn set_data_dir(dir: PathBuf) -> Result<(), PathError> {
-    OVERRIDE.set(dir).map_err(|_| PathError::AlreadySet)
+    let existing = OVERRIDE.get().map(PathBuf::as_path);
+    reusable(existing, &dir)?;
+    if existing.is_none() {
+        // 上一句刚确认过是空的；真被抢了也只可能是同一个路径（同一个进程里只有
+        // `android_main` 会走到这里），所以丢弃返回值不算吞错
+        let _ = OVERRIDE.set(dir);
+    }
+    Ok(())
+}
+
+/// 这次指定的目录能不能用：没定过、或与已定的是**同一个**目录都可以，换成别的目录不行。
+///
+/// 判据是路径相等，不是"有没有定过"。抽出来是为了能单测：`set_data_dir` 自己带着
+/// `target_os` 的 `cfg`，桌面上编不出来。
+#[cfg(any(target_os = "android", test))]
+fn reusable(existing: Option<&Path>, dir: &Path) -> Result<(), PathError> {
+    match existing {
+        Some(existing) if existing != dir => Err(PathError::AlreadySet),
+        _ => Ok(()),
+    }
 }
 
 /// 数据库文件
@@ -101,9 +123,25 @@ mod tests {
         );
     }
 
-    /// 没指定时仍然走 `directories`：桌面语义一点没变
+    /// 没指定时仍然走 `directories`
     #[test]
     fn without_an_override_the_platform_directory_is_used() {
         assert_eq!(resolve(None).unwrap(), data_dir().unwrap());
+    }
+
+    /// 同一个目录再来一次要放行：`android-activity` 会在同一个进程里重起 `android_main`
+    /// （Activity 重建、退出后重开），第二次拒了就是"一开就退回桌面"
+    #[test]
+    fn the_same_directory_can_be_set_again() {
+        let dir = Path::new("/data/user/0/com.today.diary/files");
+        assert!(reusable(None, dir).is_ok(), "还没定过：可以用");
+        assert!(reusable(Some(dir), dir).is_ok(), "与已定的是同一个：还是它");
+        assert!(
+            matches!(
+                reusable(Some(dir), Path::new("/data/user/0/别的包/files")),
+                Err(PathError::AlreadySet)
+            ),
+            "换成另一个目录：拒绝"
+        );
     }
 }

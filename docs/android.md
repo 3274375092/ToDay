@@ -26,7 +26,7 @@
 | 系统栏 | ✓ 内容从状态栏下沿起画（顶栏完整、「锁定」可点），底栏在手势条之上。**但走的是运行时那条路**：主题里的 `windowOptOutEdgeToEdgeEnforcement` 在这台 Android 16 上没生效，见「已知取舍」的“系统栏走运行时 API”一条 |
 | 软键盘 | ✓ 点输入框就弹（`mInputShown=true`），窗口跟着键盘缩（`adjustResize` + `windowSoftInputMode`）。**但这台机器上偶发弹不出来**：最后一次 show 是 `STATUS_SUCCESS`，紧接着 `system_server` 发了一次 hide（`mViewVisibility=GONE`）；同一时刻系统“设置”的搜索框能弹，所以不是设备级的。判据看 `dumpsys input_method` 的 `ImeTracker` 与 `mSoftInputShowHideHistory`，详见"中文输入"的“编辑器信息”一节 |
 | 指尖点按与注入点按 | ✓ 两者都能把光标落进密码框（`adb shell input tap 630 1187` 之后密码框出现文本光标）。之前“手指点按整个不工作”的根因是应用自己崩了，不是触摸链路，见下方“点按曾整个不工作” |
-| 键盘的字能不能进应用 | 应用侧已经接上了（见"中文输入"）：字从 `AndroidApp` 的文本快照读出来、差分后注进 `egui`。注入的 `KeyEvent` 仍然不行：`adb shell input text abc123` 一个字都没进（winit 的角色反查靠设备的 `KeyCharacterMap`，注入的虚拟设备查不到） |
+| 键盘的字能不能进应用 | 应用侧已经接上了（见"中文输入"）：字从 `AndroidApp` 的文本快照读出来、差分后注进 `egui`。**而注入的 `text` / 按键本来就进得来**：`adb shell input text 12345678`（8 个点）、`input text abc`（3 个点）、`input keyevent KEYCODE_DEL`（退格）都在密码框上量到过（2026-09-18，Android 16）。先记的那条"`adb shell input text abc123` 一个字都没进"不成立——它是当时带着会崩的 `ToDayActivity` 量的；真机跑测试可以直接用 `input text` 把字打进应用，只有输入法（拼音上屏）那条路必须用手指 |
 | 返回键退出 | ✓ 干净退出，崩溃缓冲区 0 条；Activity 正常结束、前台回桌面；重开时同一个进程里重新起 `android_main`（数据还在） |
 | 崩溃 | ✓ `adb logcat -b crash` 全程 0 条 |
 
@@ -78,7 +78,7 @@ Gradle 找 SDK 靠 `ANDROID_HOME` / `ANDROID_SDK_ROOT`，或者 `android/local.p
 ```powershell
 pwsh scripts/build-android.ps1                 # 真机：arm64-v8a + debug APK
 pwsh scripts/build-android.ps1 -Abi x86_64     # 模拟器
-pwsh scripts/build-android.ps1 -Release        # release 的 .so 与 APK
+pwsh scripts/build-android.ps1 -Release        # release 的 .so 与 APK（未签名，装不上）
 ```
 
 脚本就两步，拆开跑也一样：
@@ -95,6 +95,17 @@ cd android && ./gradlew assembleDebug          # Windows: gradlew.bat
 ```bash
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 adb logcat -s ToDay          # 应用自己的日志；eframe / wgpu 的日志是别的 tag
+```
+
+⚠️ **这台 ROM 上 `-r` 不一定是更新，可能是重装（那就把库一起删了）**：2026-09-18 装一份
+release 包时，vivo 的安装拦截（`com.android.packageinstaller/.PackageInterceptActivity`）
+把它办成了全新安装——`firstInstallTime` 重置成那一刻、应用 uid 从 `u0_a415` 变成 `u0_a419`，
+私有目录连同 `today.db` 一起没了（签名指纹两边相同，不是签名不一致）。本应用
+`allowBackup=false`、没有导出，所以重装等于丢日记。**在这台机器上装任何包之前先备库，装完对一下是不是更新**：
+
+```bash
+adb shell run-as com.today.diary cat files/today.db > today-backup.db   # 需要 debuggable 的包
+adb shell dumpsys package com.today.diary | grep -E "firstInstallTime|lastUpdateTime"
 ```
 
 装之前可以先看看包里到底装了什么（不依赖真机）：
@@ -191,26 +202,110 @@ Android 目标上开，桌面没有这个钩子，行为一字不变）。
 ## 返回键与退出
 
 返回键（`Keycode::Back` → winit 的 `Key::Named(BrowserBack)` → egui 的 `Key::BrowserBack`）
-逐层退：**浮层 → 搜索 → 关窗**；键盘开着时那一下先收键盘（Android 的规矩，不是应用拦的）。
+逐层退：**浮层 → 搜索 → 关窗**；键盘开着时那一下先收键盘（Android 的规矩，不是应用拦的）——
+真机上量到：解锁屏上密码框一直拿着焦点、应用每帧都在要键盘，所以**要按两三下才退得出去**。
 
 退到底时 `App::handle_back` 发的是 [`egui::ViewportCommand::Close`]，也就是桌面点关闭按钮那条路：
-`handle_close_request` 先把待写的写完（写不成就不关），事件循环退出 → `run_native` 返回 →
-`android_main` 返回 → **`android-activity` 的 springboard 自己调 `GameActivity_finish()`**
-把 Activity 正常结束。
+`handle_close_request` 先把待写的写完（写不成就不关）→ 事件循环退出 → `run_native` 返回 →
+`android_main` 返回前调 `end_process`：`android.os.Process.killProcess(Process.myPid())`，
+把**整个进程收掉**。
 
-**不要在这里 `std::process::exit`。** 第一版就是这么写的，真机上直接崩：
+### 为什么必须收掉进程，不能留给系统
 
+winit 0.30 的 `EventLoop` **一个进程只能建一次**：`EVENT_LOOP_CREATED` 是进程级 `AtomicBool`
+（`winit/src/event_loop.rs`），`build()` 里置 true 之后除了 web 那条路没有复位，也没有 `Drop`。
+而 Android 会把刚退出的进程缓在后台、下次启动直接复用它——于是第二次 `android_main` 的
+`run_native` 只会报错。真机上（vivo V2453A / Android 16）连着量到两层：
+
+```text
+# set_data_dir 幂等性修之前：第二次 android_main 定数据目录就被拦下
+E ToDay: 数据目录定不下来：本进程的数据目录已经定过了
+# 那一层修完之后：退到更后面一层，窗口仍然起不来
+E ToDay: 窗口起不来：winit EventLoopError: EventLoop can't be recreated
 ```
+
+两次的现象一模一样：`adb shell pidof com.today.diary` 关窗后仍有值（进程 cached）、
+`am start` 之后 `topResumedActivity` 还是 `com.bbk.launcher2/.Launcher`——
+用户看到的是“点开图标闪一下回桌面”。收掉进程之后同一条路正常：新 pid、解锁屏出来、
+`logcat -s ToDay` 里没有 error。
+
+判据（复现与验收都是这三条）：
+
+```bash
+adb shell am start -n com.today.diary/com.google.androidgamesdk.GameActivity   # 起来
+adb shell input keyevent KEYCODE_BACK                                          # 退到桌面（键盘开着要两下）
+adb shell pidof com.today.diary         # 收掉之后：空；没收掉：还是那个 pid
+```
+
+2026-09-18 在真机上按这三条跑过（同一个进程，Android 16）：
+
+| 步骤 | 量到的 |
+| --- | --- |
+| 启动 | `pid=12868`，`topResumedActivity` = GameActivity |
+| 第 1 下返回键 | 只收键盘（`top` 还是 ToDay，`pid` 不变） |
+| 第 2 下返回键 | `pidof` 空、`top` = launcher、日志 `I ToDay: 退出：收掉这个进程（pid 12868）`、`logcat -b crash` 0 条 |
+| 再启动 | **新** `pid=13134`，解锁屏出来，日志里没有 `窗口起不来` / `数据目录定不下来`；`files/today.db` 仍是 20480 字节、mtime 未变（WAL 也干净：`-wal` 0 字节），解锁后 18/19 两天的正文都在 |
+
+### Activity 被系统销毁之后：轮询 `isDestroyed()`
+
+销毁（内存回收、或 `configChanges` 没盖住的配置变更）之后 winit 不会结束事件循环，进程会
+变成"没有窗口还在跑"的僵尸：解锁后的密钥留在内存里，而且下次启动只能撞
+`EventLoopError::RecreationAttempt`。所以 `App::exit_if_activity_gone` 在 `raw_input_hook` 里
+每帧问一次 `Activity.isDestroyed()`（`crate::android::activity_gone`），`Some(true)` 就
+**先 `flush` 再 `end_process`**；读不到答案（`None`）时什么都不做——留着僵尸比误杀一个
+还活着的 Activity 安全。
+
+真机上量到两部分（vivo V2453A / Android 16）：
+
+| 验的 | 怎么验的 | 结果 |
+| --- | --- | --- |
+| 不误杀（正常 Home / 返回前台） | 正常启动 → Home → 再点开 | `pid` 不变、走恢复、日志里没有 `Activity 已经销毁` |
+| JNI 调用真的通 | 临时打一行日志看它的返回值（见下） | `real=Some(false)`——不是 `None`，方法名/签名/对象都对 |
+| "先落盘再收进程"整条路 | 临时把 `files/exit_test` 当日志里的"已销毁"（见下） | 正文里打字后 0.2s 触发：日志 `Activity 已经销毁：落盘后收掉这个进程` → 12ms 后 `退出：收掉这个进程`，`pidof` 空；重开解锁后**那三个字在正文里**（61 → 64 字） |
+
+**没验到的是"真销毁"那次触发**：这台 ROM 造不出"销毁后留个空档"——
+`always_finish_activities=1`（按 Home 后 ActivityRecord 还在）、
+`am start -f 0x40000000`（`FLAG_ACTIVITY_NO_HISTORY`，同样没销毁）、改系统字号（见下）
+三条都不行。上面第二、三行靠的是一段**临时代码**（把 `files/exit_test` 存在当作已销毁，
+并在 `activity_gone` 里打一行 `TEMP activity_gone: real=… forced=…`），
+验完已经删掉。换一台会真销毁 Activity 的机器/系统版本时，这段临时仪表可以照上面那行重加回去。
+
+轮询还有帮不上的一种：**销毁与重建连着发生**（`am start -f 0x00008000`，CLEAR_TASK）——
+中间没有空档，`android_main` 已经又跑了一轮，用户看到的是"点一下没反应，再点一下才开"
+（第二次拿到的是干净的进程）。想连这一次也救回来，只能在第二轮 `android_main` 里
+"再拉起一次 Activity 然后换进程"，那笔账另算。
+
+`end_process` 拿不到 JVM 或调用失败时只写一条 warn，退回 `android-activity` 那条老路
+（它会在 `android_main` 返回后调 `GameActivity_finish()` 结束 Activity，但进程还是留着）。
+
+代价：关窗即结束进程，下次启动是冷启动（真机上 `Displayed +311ms` 那一档）；
+换来的是"退出再点开一定起得来"，以及退出后内存里不留密钥。
+
+**不要用 `std::process::exit` 收尾。** 第一版就是这么写的，真机上直接崩：
+
+```text
 I ToDay  : 返回键退出：待写的编辑已经落盘
 F ...: JNI DETECTED ERROR: thread "android_main" using JNIEnv* from thread "main"
 F libc  : Fatal signal 6 (SIGABRT)
 ```
 
 进程退出会去拆 JVM 与 C++ 静态对象，而那时 Java 的 UI 线程还在跑（hwui 死锁 + JNIEnv 跨线程误用）。
-android-activity 的文档也明确说别这么干；它给的替代路就是"让 `android_main` 返回"。
+`killProcess` 只是给自己的进程发一个信号，不碰 JVM 状态；数据在这之前已经落过盘
+（关窗路上 `App::handle_close_request` 写完才放行，切后台也有 `App::save`），WAL 也不会留下半个事务。
 
-代价：关窗后进程会留在后台（Android 正常行为），重开时在同一个进程里重新起 `android_main`——
-真机上验过，重开正常、数据还在。
+### `android_main` 仍要能再跑一遍
+
+收掉进程之后，正常路径上不会再有第二次 `android_main`；但 Activity 被系统重建时仍会有：
+`configChanges` 没盖住的配置变更会重建 Activity，而重建就是同一个进程里新起一条线程调
+`android_main`——那一次注定撞 `EventLoopError::RecreationAttempt`，由 `end_process` 收尾。
+
+`configChanges` 里补了 `fontScale|locale|layoutDirection`（界面是 `egui` 自己画的，字号与语言
+都不跟系统走，本来就不需要重建）。但要说清：**这三项在这台机器上验不出效果**——
+拿去掉这三项的包做过 A/B，改系统字号（1.0 → 1.15 / 1.2）两边都不重建 Activity，
+所以它只是一道防线，不是已经量到的修复。
+
+所以 `paths::set_data_dir` 对**同一个**目录放行、对另一个目录报 `AlreadySet`（`src/paths.rs`）：
+重建那次拿到的是同一个私有目录，不能因为“已经定过”就不启动。
 
 ## 中文输入
 
@@ -322,6 +417,9 @@ type=TYPE_SHOW - STATUS_FAIL - com.vivo.secime.service:...        ← 请求者�
 真机上要用手指过一遍（我拄不到候选栅）：拼音候选上屏进正文、输入法退格删对一个字、
 组词期间拼音不出现在正文里。单测盯的是差分本身，盯不到“快照里到底有没有字”。
 
+错误条（Android 上高 48pt，装得下那枚 45pt 的「重试」）：只有真的写盘失败才会出现，
+真机上还没造出来过；判据是 `run-as com.today.diary` 把 `files/` 改成不可写，再在正文里敲一个字。
+
 ## 窄屏外壳
 
 - 断点 `shell::MOBILE_BREAKPOINT` = 600pt，判据是整窗宽度。桌面窗口最小 720pt，
@@ -402,8 +500,9 @@ type=TYPE_SHOW - STATUS_FAIL - com.vivo.secime.service:...        ← 请求者�
   所以 `adjustResize` 不动，也不为此引入 IME inset 布局。
 - **输入法快照是“全量比对”，不是“收到一次回调”**：比的是上一次的正文，所以输入法把光标
   移到别处（正文没变）不会产出任何动作；代价是“改到中间”只能退到公共前缀再重打（多几次退格）。
-- **退格去重会丢一次“双重退格”**：同一帧里键盘退格与快照变短同时出现时只算一次；
-  一次按键删两个字的输入法在这条路上会少删一个（比“一下删两个字”安全）。
+- **退格按条数合并**：同一帧里键盘退格（`sendKeyEvent` → winit）与快照变短可能同时出现，
+  按"删掉的总数 = max(键盘那几次, 快照少的字数)"合并，只补差额；两边数目对不上时
+  （输入法删两个字只报了一次按键）以快照为准——那是输入法眼里的真实正文。
 - **快照的读法是绕上游 bug 的**：`android-activity` 0.6.1 的 `text_input_state()` 在输入法还没
   推过东西时会 `abort`（判据见"中文输入"），所以自己调 AGDK 的 C 接口。上游出新版、
   且修了这条之后，那一段可以换回公开 API。

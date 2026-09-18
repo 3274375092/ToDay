@@ -9,12 +9,13 @@
     Android SDK        ANDROID_HOME / ANDROID_SDK_ROOT，或 android/local.properties 里的 sdk.dir
     Android NDK        ANDROID_NDK_HOME / ANDROID_NDK_ROOT / NDK_HOME 之一，或 SDK 下的 ndk/
     JDK 17             JAVA_HOME
-  产物：android/app/build/outputs/apk/<debug|release>/app-<debug|release>.apk
+  产物：android/app/build/outputs/apk/<debug|release>/ 下的 app-<debug|release>[-unsigned].apk
+        脚本按 AGP 给的名字去找，不写死：没配 signingConfig 时 release 那份带 -unsigned，装不上
 
 .EXAMPLE
   pwsh scripts/build-android.ps1                  # 真机用的 arm64-v8a + debug APK
   pwsh scripts/build-android.ps1 -Abi x86_64      # 模拟器
-  pwsh scripts/build-android.ps1 -Release         # release 的 .so 与 APK
+  pwsh scripts/build-android.ps1 -Release         # release 的 .so 与 APK（未签名，装不上）
 #>
 # 注意：本文件存为 UTF-8 **带 BOM**。Windows PowerShell 5.1 不带 BOM 时会按 GBK 读，
 # 中文注释的字节会吃进引号，整个脚本报语法错（改完记得用带 BOM 的方式存回去）。
@@ -40,7 +41,20 @@ if (-not ($env:ANDROID_NDK_HOME -or $env:ANDROID_NDK_ROOT -or $env:NDK_HOME)) {
     $sdk = $env:ANDROID_HOME
     if (-not $sdk) { $sdk = $env:ANDROID_SDK_ROOT }
     if (-not $sdk) {
-        throw "找不到 Android SDK：设 ANDROID_HOME，或在 android/local.properties 里写 sdk.dir"
+        # 与 Gradle 同一个来源：android/local.properties 里的 sdk.dir（AGP 生成的，不进仓库）
+        $localProps = Join-Path $androidDir "local.properties"
+        if (Test-Path $localProps) {
+            $line = Select-String -Path $localProps -Pattern '^\s*sdk\.dir\s*=' |
+                Select-Object -Last 1
+            if ($line) {
+                # properties 里路径可能写成 C:/... 也可能写成 C:\\...，两种都收
+                $sdk = ($line.Line -replace '^\s*sdk\.dir\s*=\s*', '').Trim() -replace '\\\\', '\'
+                Write-Host "用 local.properties 里的 SDK：$sdk" -ForegroundColor DarkGray
+            }
+        }
+    }
+    if (-not $sdk) {
+        throw "找不到 Android SDK：设 ANDROID_HOME / ANDROID_SDK_ROOT，或在 android/local.properties 里写 sdk.dir"
     }
     $ndkRoot = Join-Path $sdk "ndk"
     if (-not (Test-Path $ndkRoot)) { throw "找不到 NDK：$ndkRoot 不存在（用 sdkmanager 装 ndk;<版本>）" }
@@ -70,6 +84,15 @@ try {
     Pop-Location
 }
 
-$apk = Join-Path $androidDir "app/build/outputs/apk/$(if ($Release) { 'release' } else { 'debug' })/app-$(if ($Release) { 'release' } else { 'debug' }).apk"
-Write-Host "APK：$apk" -ForegroundColor Green
-Write-Host "安装：adb install -r `"$apk`"" -ForegroundColor Green
+# 3) 报出产物。名字不写死：没配 signingConfig 时 release 的产物叫
+#    `app-release-unsigned.apk`，而 debug 那份可以直接装
+$outDir = Join-Path $androidDir "app/build/outputs/apk/$(if ($Release) { 'release' } else { 'debug' })"
+$apk = Get-ChildItem -Path $outDir -Filter "*.apk" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime | Select-Object -Last 1
+if (-not $apk) { throw "没找到 APK：$outDir 下没有 .apk" }
+Write-Host "APK：$($apk.FullName)" -ForegroundColor Green
+if ($apk.Name -like "*-unsigned*") {
+    Write-Host "这个包没有签名，装不上：要装机请走 debug，或先给 release 配 signingConfig" -ForegroundColor Yellow
+} else {
+    Write-Host "安装：adb install -r `"$($apk.FullName)`"" -ForegroundColor Green
+}

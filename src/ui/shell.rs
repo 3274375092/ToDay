@@ -34,6 +34,10 @@ const EMPTY_HINT_WIDE: &str = "点左边日历上的任何一天，就可以开�
 /// 窄屏的空页提示：日历收在底栏「日历」那枚按钮开的浮层里
 const EMPTY_HINT_NARROW: &str = "点底栏「日历」挑一天，就可以开始写";
 const ERROR_BAR_HEIGHT: f32 = 34.0;
+/// Android：错误条上那枚按钮的高度由 `theme::BUTTON_PAD_Y`（= `TOUCH_PAD_Y` 14）撑出来，
+/// 实测 17pt 字高 + 上下各 14 = 45pt。面板比按钮矮时 egui 会把按钮裁掉（panel 会
+/// `set_clip_rect`），而写失败时它是唯一的恢复入口。
+const ERROR_BAR_HEIGHT_TOUCH: f32 = theme::TOUCH_TARGET + 4.0;
 /// 面板左右内边距
 const PANEL_PADDING_X: i8 = 22;
 /// 底栏那枚修饰键键帽：判据是 `Modifiers::command`，macOS 上它认的是 Cmd 不是 Ctrl
@@ -45,7 +49,11 @@ const COMMAND_KEY: &str = if cfg!(target_os = "macos") {
 
 /// 顶栏 / 底栏 / 错误条用的面板高度
 pub fn error_bar_height() -> f32 {
-    ERROR_BAR_HEIGHT
+    if cfg!(target_os = "android") {
+        ERROR_BAR_HEIGHT_TOUCH
+    } else {
+        ERROR_BAR_HEIGHT
+    }
 }
 
 /// 面板的水平内边距
@@ -57,7 +65,8 @@ pub fn panel_padding_x() -> i8 {
 ///
 /// 面板不认识"窄屏/宽屏"（见 `docs/architecture.md` 的"为什么窄屏只换外壳"），
 /// 断点由 `App::diary_screen` 判、结果经 [`Chrome::of`] 传进来。
-/// 宽屏那一组取值与外壳写死它们时逐值相同，桌面行为不变。
+/// 宽屏那一组取值必须与宽屏那两条面板对上（撤销条的偏移 = `STATUS_BAR_HEIGHT` + `TOAST_GAP`），
+/// `narrow_chrome_keeps_the_undo_toast_on_screen` 盯着它。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Chrome {
     /// 空页那行提示：两种布局里"日历"不在同一个地方

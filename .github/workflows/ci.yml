@@ -37,8 +37,9 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # 缓存 ~/.cargo 与 target/：改自己的代码时不重编依赖
-      - uses: Swatinem/rust-cache@v2
+      # 缓存 ~/.cargo 与 target/：改自己的代码时不重编依赖。
+      # 钉到 commit（= v2 当时的 HEAD）：tag 是可变的，被改写就等于换了代码
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       # 便宜的先跑：红了就不用等后面的
       - name: 格式
@@ -78,7 +79,7 @@ jobs:
         with:
           targets: aarch64-linux-android
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           # 与 gate 分开：两条线的 target 与 target-triple 都不一样
           key: android
@@ -90,10 +91,13 @@ jobs:
           NDK_VERSION: 27.0.12077973
         shell: pwsh
         run: |
-          $sdkmanager = "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat"
+          $sdk = $env:ANDROID_HOME
+          $sdkmanager = "$sdk\cmdline-tools\latest\bin\sdkmanager.bat"
           & $sdkmanager "ndk;$env:NDK_VERSION"
           # cargo-ndk 认这三个里的任意一个
-          "ANDROID_NDK_HOME=$env:ANDROID_HOME\ndk\$env:NDK_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $ndkHome = "$sdk\ndk\$env:NDK_VERSION"
+          "ANDROID_NDK_HOME=$ndkHome" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: 装 cargo-ndk
         run: cargo install cargo-ndk

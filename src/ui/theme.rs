@@ -471,8 +471,11 @@ const KEY_BELOW: f32 = 0.53;
 const BUTTON_PAD_X: f32 = 10.0;
 /// 幽灵按钮的上下内边距。
 ///
-/// Android 上撑到 [`TOUCH_TARGET`]：按钮那点字高（`sans_bold(12.5)` 约 16.5pt）
-/// 加上上下各一遍，正好够一只手指。桌面还是原来那个 6，顶栏高度一分没变。
+/// Android 上撑到 [`TOUCH_TARGET`]：按钮那点字高（`sans_bold(12.5)` 实测 17pt）
+/// 加上上下各一遍，正好够一只手指。桌面 6：没有手指这回事，按钮沿用窄内边距。
+///
+/// 装这类按钮的容器得跟着放宽：比按钮矮的容器会被 egui 裁掉（错误条那一处见
+/// [`crate::ui::shell::error_bar_height`]）。
 const BUTTON_PAD_Y: f32 = if cfg!(target_os = "android") {
     TOUCH_PAD_Y
 } else {
@@ -956,8 +959,8 @@ mod tests {
 
     /// 每个角色都得有中文兜底。
     ///
-    /// 漏一条平台路径的症状是真机上把汉字画成 `?`：Android 上衬线那条就这样漏过——
-    /// Windows / macOS / Linux 都写了，就少了 `/system/fonts`。
+    /// 漏一条平台路径的症状是真机上把汉字画成 `?`；衬线那条最容易漏：汉字那几个角色里只有它
+    /// 要 `/system/fonts/NotoSerifCJK-Regular.ttc`，桌面上四个平台都写了看不出问题。
     /// 这里用一个"只认 Android 系统字体"的读取器跑一遍，四个家族的中文键都该在。
     #[test]
     fn every_role_has_a_chinese_fallback_on_android() {

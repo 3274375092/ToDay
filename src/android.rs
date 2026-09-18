@@ -13,10 +13,19 @@
 //!   这里把 `AndroidApp` 交给 [`crate::app::App::with_ime_source`]，由控制器每帧读一次
 //!   快照（读法见 `ime_snapshot`，差分见 [`crate::ime`]）。
 //! * **退出**：手机上关不掉窗口，返回键退到底时 `App` 发 `ViewportCommand::Close`；
-//!   `run_native` 返回之后本函数就返回，`android-activity` 的 springboard 会接下去调
-//!   `GameActivity_finish()` 把 Activity 正常结束——**不要自己 `std::process::exit`**（见下方注释）。
+//!   `run_native` 返回之后本函数**把这个进程收掉**（[`end_process`]，不能让进程留在后台
+//!   被下次启动复用——winit 的 `EventLoop` 一辈子只能建一次）。
 //!
 //! 不碰窗口尺寸记忆（[`crate::window_state`]）：手机上只有一个全屏窗口，`window.txt` 没有意义。
+//!
+//! ## 直接调 JNI 的那几处
+//!
+//! `pin_decor_fits` / `native_handle` / `activity_gone` / `end_process` 都从
+//! `AndroidApp::vm_as_ptr()` / `activity_as_ptr()` 拿裸指针，再交给 `jni` 的
+//! `JavaVM::from_raw` / `JObject::from_raw`。两件事让这件事是安全的：
+//! `AndroidApp` 手里是 JVM 全局引用（`Activity` 活到 `onDestroy` 之后、JVM 活到进程结束），
+//! 调用期间一定有效；`jni` 0.22 的 `JavaVM` 只是个句柄包装，**没有 `Drop`**，
+//! 不会在 `from_raw` 造出来的临时值上误调 `DestroyJavaVM`。
 
 use crate::boot;
 use crate::paths;
@@ -31,14 +40,15 @@ use winit::platform::android::activity::AndroidApp;
 /// 日志里带的标签，`adb logcat -s ToDay` 按它过滤
 const LOG_TAG: &str = "ToDay";
 
-/// eframe 的持久化文件。里面只可能有窗口设置，正文一个字都不会进去（见 `persistence_path`）。
+/// eframe 的持久化文件。里面只有 eframe 自己记的窗口状态（真机上量过，154 字节），
+/// 正文一个字都不会进去（见 `persistence_path`）。
 const STORAGE_FILE: &str = "app.ron";
 
 /// Android 的入口，签名与符号名由 `android-activity` 规定（`GameActivity` 用 `dlsym`
 /// 找这个符号），不能改。入参叫 `android_app` 是为了不与上面那个控制器 `app` 撞名。
 ///
-/// 装配失败（拿不到私有目录、库打不开）时只写一条 logcat 然后返回：没有界面可报错，
-/// 写了人也看不见；进程留给系统回收，用户重开一次就是重试。
+/// 装配失败（拿不到私有目录、库打不开）时只写一条 logcat：没有界面可报错，写了人也看不见。
+/// **无论哪条路返回，进程都会被 [`end_process`] 收掉**：留给下次启动一个干净的进程。
 #[unsafe(no_mangle)]
 pub fn android_main(android_app: AndroidApp) {
     android_logger::init_once(
@@ -51,6 +61,21 @@ pub fn android_main(android_app: AndroidApp) {
     // 所以越早越好（`android_main` 本来就在 `GameActivity.onCreate` 里跑）
     pin_decor_fits(&android_app);
 
+    run(android_app.clone());
+
+    // 到这里说明本进程的 `android_main` 已经结束（正常退出，或者界面根本起不来）。
+    // `android-activity` 本来会在 `android_main` 返回后自己调 `GameActivity_finish()` 结束
+    // Activity，但**进程会留在后台被下次启动复用**，而 winit 0.30 的 `EventLoop` 一个进程
+    // 只能建一次（`EVENT_LOOP_CREATED` 是进程级 `AtomicBool`，除了 web 那条路没有复位），
+    // 于是第二次 `run_native` 直接 `EventLoopError::RecreationAttempt`：
+    // 用户看到的是“点开图标闪一下回桌面”（真机上量到过，见 `docs/android.md`）。
+    end_process(&android_app);
+}
+
+/// 装配控制器、把 eframe 的事件循环跑起来，直到窗口关闭。
+///
+/// 返回不代表“正常退出”：拿不到数据目录、库打不开都在里面提前返回（返回前只写日志）。
+fn run(android_app: AndroidApp) {
     let Some(dir) = android_app.internal_data_path() else {
         log::error!("拿不到 app 私有目录，日记本没有可落盘的地方，不启动界面");
         return;
@@ -74,12 +99,6 @@ pub fn android_main(android_app: AndroidApp) {
             return;
         }
     };
-    // 返回键退到底之后走的就是桌面那条"关窗"路：App 发 `Close`，`handle_close_request`
-    // 先把待写的写完（写不成就不关），事件循环退出，本函数返回，
-    // 然后 `android-activity` 自己调 `GameActivity_finish()`。
-    //
-    // 真机上量过：在这里（或任何地方）用 `std::process::exit` 收尾会在错误线程上拆 JVM，
-    // 直接 `JNI DETECTED ERROR` + `SIGABRT`。见 `docs/android.md` 的"返回键与退出"。
     let app = match boot::assemble(&path) {
         Ok(app) => app,
         Err(err) => {
@@ -109,8 +128,8 @@ pub fn android_main(android_app: AndroidApp) {
             ..Default::default()
         },
         android_app: Some(android_app),
-        // 只为拿到切后台时的 `App::save` 钩子。文件里永远是空的：`App::persist_egui_memory`
-        // 返回 false，egui 的内存（含输入框撤销缓冲里的正文）不会被写进去。
+        // 只为拿到切后台时的 `App::save` 钩子；egui 的内存（含输入框撤销缓冲里的正文）不进
+        // 这个文件（`App::persist_egui_memory` 返回 false，见 [`STORAGE_FILE`]）。
         persistence_path: Some(storage_path),
         ..Default::default()
     };
@@ -125,6 +144,76 @@ pub fn android_main(android_app: AndroidApp) {
     ) {
         log::error!("窗口起不来：{err}");
     }
+}
+
+/// 结束本进程：`android.os.Process.killProcess(Process.myPid())`。
+///
+/// 为什么必须收掉：winit 0.30 的 `EventLoop` 一个进程只能建一次（见 `android_main` 的
+/// 注释），而 Android 会把退出的进程缓在后台、下次启动直接复用——留着它，用户下次点开
+/// 图标就是“闪一下回桌面”。
+///
+/// 为什么不用 `std::process::exit`：真机上那样会在本线程上拆 JVM 与 C++ 静态对象，
+/// 而 Java 的 UI 线程还在跑，直接 `JNI DETECTED ERROR` + `SIGABRT`（见 `docs/android.md`
+/// 的“返回键与退出”）。`killProcess` 只是给自己的进程发一个信号，不碰 JVM 状态。
+///
+/// 数据安全：走到这里之前已经落过盘——关窗路上 `App::handle_close_request` 写完才放行，
+/// 切后台也有 `App::save`；SQLite 开的是 WAL，硬杀不会留下半个事务。
+///
+/// 拿不到 JVM 或调用失败时只写一条 warn：交给 `android-activity` 自己
+/// `GameActivity_finish()` 结束 Activity，进程留给系统回收（下次启动可能又起不来，
+/// 但比在这里 panic 好）。
+///
+/// 也可以被 [`crate::app::App::exit_if_activity_gone`] 调：那条路是“Activity 已经被销毁”，
+/// 它先落盘再叫这里。
+pub(crate) fn end_process(app: &AndroidApp) {
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    let outcome = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+        let process = env.find_class(jni::jni_str!("android/os/Process"))?;
+        let pid = env
+            .call_static_method(&process, jni::jni_str!("myPid"), jni::jni_sig!("()I"), &[])?
+            .i()?;
+        log::info!("退出：收掉这个进程（pid {pid}）");
+        env.call_static_method(
+            &process,
+            jni::jni_str!("killProcess"),
+            jni::jni_sig!("(I)V"),
+            &[jni::objects::JValue::Int(pid)],
+        )?;
+        Ok(())
+    });
+    if let Err(err) = outcome {
+        log::warn!("没能收掉进程（{err}）：留给系统回收");
+    }
+}
+
+/// Activity 已经被销毁了没有：`Activity.isDestroyed()`（API 17+）。
+///
+/// 为什么需要它：Activity 被系统销毁时 winit 0.30 不把 `MainEvent::Destroy` 转上来
+/// （见 `docs/android.md` 的“返回键与退出”），事件循环会一直跑下去——进程成了
+/// “没有窗口”的僵尸：解锁后的密钥留在内存里，而下次启动只能撞
+/// `EventLoopError::RecreationAttempt`。调用方（`App::exit_if_activity_gone`）拿它决定
+/// 要不要收掉进程。
+///
+/// 读不到（拿不到 JVM、方法不存在）返回 `None`：调用方什么都不做——留着僵尸比误杀一个
+/// 还活着的 Activity 安全得多。
+///
+/// 线程：`android_main` 那条（每帧从 `raw_input_hook` 里调）。线程已经挂在 JVM 上时
+/// `attach_current_thread` 只查一次 TLS，代价就是一次 `isDestroyed()` 调用。
+pub(crate) fn activity_gone(app: &AndroidApp) -> Option<bool> {
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    let activity = app.activity_as_ptr().cast();
+    vm.attach_current_thread(|env| -> jni::errors::Result<bool> {
+        // 这个指针是 `AndroidApp` 持有的全局引用，调用期间一直有效
+        let activity = unsafe { JObject::from_raw(env, activity) };
+        env.call_method(
+            &activity,
+            jni::jni_str!("isDestroyed"),
+            jni::jni_sig!("()Z"),
+            &[],
+        )?
+        .z()
+    })
+    .ok()
 }
 
 /// 请系统把内容区让开状态栏与手势条：`Window.setDecorFitsSystemWindows(true)`。

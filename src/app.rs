@@ -290,7 +290,7 @@ impl App {
     /// 接上输入法快照的来源（只有 Android 入口会调，见 `src/android.rs`）。
     ///
     /// 接了之后 [`eframe::App::raw_input_hook`] 每帧读一次输入法快照，把差量注入成
-    /// 这一帧的 `egui` 事件。不接（桌面、测试）时那条路根本不存在，行为与以前一字不差。
+    /// 这一帧的 `egui` 事件。不接（桌面、测试）时那条路根本不存在。
     ///
     /// native handle 不在这里取：`initializeNativeCode` 先起 `android_main` 再写 Java 的
     /// `nativeHandle`，这一步问到的可能就是 0。头几帧由 `App::ensure_ime_handle` 补上。
@@ -325,25 +325,32 @@ impl App {
         self.ime_committed = committed;
         let injected = !actions.is_empty();
 
-        // 这一帧已经收到键盘的退格时不再补退格：输入法删字可能既走 `sendKeyEvent`
-        // （→ winit → `Key::Backspace`）又改快照，两边都注入就一按删两个字
-        let keyboard_backspace = raw_input.events.iter().any(|event| {
-            matches!(
-                event,
-                egui::Event::Key {
-                    key: egui::Key::Backspace,
-                    pressed: true,
-                    ..
-                }
-            )
-        });
+        // 输入法删字可能既走 `sendKeyEvent`（→ winit → `Key::Backspace`）又改快照，
+        // 两边都注入就一按删两个字。按**条数**合并：键盘那几次本来就删了字，只补够
+        // `count` 的差额——少补的次数不会自己回来（基准已经推到新快照，下一帧差不出这部分）
+        let mut keyboard_backspaces = raw_input
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+            .count();
         for action in actions {
             match action {
                 crate::ime::Injection::Text(text) => raw_input.events.push(egui::Event::Text(text)),
                 // 退格造一个按键事件：文本编辑器认的就是它（输入法删字走的是
                 // `deleteSurroundingText`，不是键盘事件）
-                crate::ime::Injection::Backspace(count) if !keyboard_backspace => {
-                    for _ in 0..count {
+                crate::ime::Injection::Backspace(count) => {
+                    let already = count.min(keyboard_backspaces);
+                    keyboard_backspaces -= already;
+                    for _ in 0..count - already {
                         raw_input.events.push(egui::Event::Key {
                             key: egui::Key::Backspace,
                             physical_key: None,
@@ -353,7 +360,6 @@ impl App {
                         });
                     }
                 }
-                crate::ime::Injection::Backspace(_) => {}
             }
         }
         injected
@@ -639,7 +645,7 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    /// 把这一帧量到的窗口尺寸写进记忆文件。    ///
+    /// 把这一帧量到的窗口尺寸写进记忆文件。
     /// 没开记忆、或写不进去时只报一句——记不下尺寸不该影响关窗。
     fn remember_window(&self, ctx: &egui::Context) {
         let Some(path) = self.window_memory.as_deref() else {
@@ -671,10 +677,9 @@ impl App {
     /// 顺序就是用户眼里的层次：浮层 → 搜索 → 关窗。
     ///
     /// 退到底时发的是 [`egui::ViewportCommand::Close`]，也就是桌面点关闭按钮那一条路：
-    /// 落盘、写失败就不关，全由 [`App::handle_close_request`] 管。手机上 `android_main`
-    /// 因此返回到 `android-activity`，由它调 `GameActivity_finish()` 结束 Activity。
-    /// **不能在这里 `std::process::exit`**：真机上那样会在错误线程上拆 JVM，直接 SIGABRT
-    /// （见 `docs/android.md` 的"返回键与退出"）。
+    /// 落盘、写失败就不关，全由 [`App::handle_close_request`] 管。手机上事件循环因此退出、
+    /// `android_main` 返回，由它收掉整个进程（见 `src/android.rs` 的 `end_process`）。
+    /// **不要在这里自己退出进程**（真机上的栈见 `docs/android.md` 的"返回键与退出"）。
     ///
     /// 桌面基本碰不到这个键（有些键盘有），碰到了也当"关闭窗口"，语义一致。
     fn handle_back(&mut self, ctx: &egui::Context) {
@@ -1133,6 +1138,7 @@ impl eframe::App for App {
         #[cfg(target_os = "android")]
         {
             self.cap_render_scale(_ctx);
+            self.exit_if_activity_gone();
             if self.ime_source.is_some() {
                 self.read_ime_snapshot(_ctx, _raw_input);
             }
@@ -1157,12 +1163,17 @@ impl eframe::App for App {
 impl App {
     /// 渲染倍率的上限（每 pt 多少物理像素）。
     ///
-    /// 屏幕原生是 3.5（1260×2800 / density 560），一帧要画 1260×2800 像素；
-    /// 哪天真撑不住帧预算，这里就是最划算的那一刀（布局单位是 pt，字与格子大小一律不变，
-    /// 只是光栅化细一点；再往下降就是 3.0 → 2.5）。
+    /// 屏幕原生是 3.5（1260×2800 / density 560），一帧要画 1260×2800 像素。
     ///
-    /// 3.5 = **不封顶**，真机上量过才定下的：3.5 时连着打字与弹浮层都是 121 帧/2s
-    /// （60Hz 满帧）、没有一帧超过一个 vsync，所以不用降。
+    /// **封顶是整界面的缩放，不是"只降光栅化"**：`egui` 只给了
+    /// `set_pixels_per_point`，它落成 `zoom_factor = 封顶值 / native`，而
+    /// `zoom_factor` 缩放全部尺寸（字号、间距、触摸目标）。所以这台机器
+    /// （native 恰好 3.5，封顶是空操作）上看不出差别，native 4.0 的机器上
+    /// 封到 3.5 就是整个界面小 12.5%。真要"降帧预算又不动布局"，得先在 `egui`
+    /// 那一层把光栅化倍率与缩放拆开。
+    ///
+    /// 3.5 = **不封顶**（见上：测试机的 native 就是它），真机上量过才定下的：3.5 时
+    /// 连着打字与弹浮层都是 121 帧/2s（60Hz 满帧）、没有一帧超过一个 vsync，所以不用降。
     const MAX_PIXELS_PER_POINT: f32 = 3.5;
 
     /// 取 native handle 的重试上限（帧数）。前面的 SQLite 打开与迁移已经把
@@ -1184,10 +1195,38 @@ impl App {
         }
     }
 
+    /// 发现 Activity 被系统销毁就落盘、然后自己收掉进程。
+    ///
+    /// 为什么要：Activity 没了之后 winit 0.30 不结束事件循环（它忽略 `MainEvent::Destroy`），
+    /// 进程会变成"没有窗口还在跑"的僵尸——解锁后的密钥留在内存里，而且下次启动只能撞
+    /// `EventLoopError::RecreationAttempt`（见 `crate::android::end_process`）。
+    /// 自己收掉之后，用户下次点开拿到的是干净的进程。
+    ///
+    /// 顺序是**先落盘再收**：真到这一步用户已经看不到界面，写不成也只记一条 error——
+    /// 留着进程并不会把编辑写进去（下次启动会先把它收掉），只会把密钥多留一会儿。
+    ///
+    /// 只在有帧的时候跑到（`raw_input_hook` 每帧一次）：这一帧要画才会问
+    /// `isDestroyed()`；没帧的时候也没什么可落的盘。读不到答案（`None`）时什么都不做，
+    /// 绝不把还活着的 Activity 误判成僵尸。
+    fn exit_if_activity_gone(&mut self) {
+        // clone 一份句柄：下面 `flush` 要 `&mut self`，而 `AndroidApp` 只是个 `Arc` 包着的句柄
+        let Some(source) = self.ime_source.clone() else {
+            return;
+        };
+        if crate::android::activity_gone(&source) != Some(true) {
+            return;
+        }
+        log::info!("Activity 已经销毁：落盘后收掉这个进程");
+        if !self.flush() {
+            log::error!("Activity 销毁后落盘失败：这次编辑会随进程一起没");
+        }
+        crate::android::end_process(&source);
+    }
+
     /// 读一次输入法快照，交给 [`App::ime_frame`] 差分、注入并排下一帧。
     ///
-    /// 快照的读法在 [`crate::android::ime_snapshot`]（只读，不改状态）：**不要**换成
-    /// `AndroidApp::text_input_state()`——它内部那个读法在输入法还没推过东西时会 `abort`。
+    /// 快照的读法在 [`crate::android::ime_snapshot`]（只读、不改状态；为什么不用
+    /// `AndroidApp::text_input_state()` 见那里）。
     /// 取不到 handle 或这一次读不出来就什么都不做，下一帧再试（只读不清标志，不会丢字）；
     /// 排帧只看焦点，与这一次读到没读到无关（见 [`App::ime_frame`]）。
     fn read_ime_snapshot(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -1267,7 +1306,7 @@ impl App {
 /// 只在 debug 构建的 Android 上存在的量尺（`adb logcat -s ToDay` 每 [`Self::WINDOW_SECONDS`]
 /// 秒一行汇总）。
 ///
-/// 量的是这一轮改动的判据：
+/// 量的是这几条判据：
 ///
 /// * egui 这一趟画了多久（p50 / p95 / 最长）与**两帧之间的间隔**（p50 / p95 / 最长、
 ///   超过一个 vsync 的帧数）——渲染倍率要不要封顶看后者（`dumpsys gfxinfo` 认不出

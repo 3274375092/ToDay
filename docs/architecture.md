@@ -394,15 +394,21 @@ C++ glue 由 `android-activity` 自带，**不要**开 prefab（两份 glue 不�
 `TextEditState` 的撤销缓冲里有一份正文，与"锁定即丢正文"直接冲突。
 所以 `App::persist_egui_memory()` 返回 `false`：句柄留着，文件永远是空的。
 
-### 为什么返回键的"退出"由 `App` 发起、由入口执行
+### 为什么返回键的"退出"走的是"关窗"那条路
 
-"按返回键该退到哪一层"是导航决策，归控制器；`std::process::exit` 是进程级动作，
-桌面与测试都不该有它。所以两句分开：`App` 逐层退到底之后调
-[`App::with_quit_hook`](crate::app::App::with_quit_hook) 装的钩子，`android.rs` 里装的才是退出。
-测试里装一个探针就能验"什么时候该退"，而不用把测试进程也退掉。
+"按返回键该退到哪一层"是导航决策，归控制器：`App::handle_back` 逐层退（浮层 → 搜索 →
+关窗），退到底时发的是 `egui::ViewportCommand::Close`——与桌面点关闭按钮同一条路。
+落盘由 `App::handle_close_request` 管（先写、写不成就不关），所以测试装一个"看窗口命令"的
+探针就能验"什么时候该退"，不用把测试进程也退掉。
 
-不调 `Activity::finish()` 的理由见 `docs/android.md`：winit 0.30 忽略
-`MainEvent::Destroy`，事件循环不会因 Activity 结束而结束。
+手机上事件循环因此退出、`run_native` 返回，`android_main` 在返回前**收掉整个进程**
+（`src/android.rs` 的 `end_process`）：winit 0.30 的 `EventLoop` 一个进程只能建一次，
+而 Android 会把退出的进程缓在后台复用——留着它，用户下次点开图标只会看到"闪一下回桌面"
+（真机上量到过，见 `docs/android.md` 的"返回键与退出"）。**不在应用里 `std::process::exit`**：
+那会在错误的线程上拆 JVM，真机上的栈见同一节。
+
+代价：关窗即结束进程，下次启动是冷启动；换来的是"退出再点开一定起得来"，
+以及退出后内存里不留密钥。
 
 ### 为什么窄屏只换外壳，不换视图
 
