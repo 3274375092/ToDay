@@ -1,1 +1,9 @@
 /target
+
+# Android：Gradle 与 AGP 的产物、本机 SDK 路径、cargo ndk 的落点
+/android/build
+/android/app/build
+/android/.gradle
+/android/local.properties
+/android/app/src/main/jniLibs
+/.idea

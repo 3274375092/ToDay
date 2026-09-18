@@ -62,30 +62,36 @@ pub const WEEKEND: Color32 = RED_FG;
 //   mono    —— 等宽，日号、字数、键位这类"仪表读数"
 //
 // 每个角色都配了中文字体兜底，避免中文变成方块。
+// Android 上字体文件都在 `/system/fonts`，只有系统那一份（`Roboto` / `Noto` / `Droid`）：
+// 不打包字体，省 10~16 MB，找不到时按下面的次序退。
 
 /// 界面无衬线（拉丁部分）
 const SANS_LATIN: &[&str] = &[
     "C:/Windows/Fonts/segoeui.ttf",
     "/System/Library/Fonts/SFNS.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/system/fonts/Roboto-Regular.ttf",
 ];
 /// 界面无衬线加粗（拉丁部分）
 const SANS_BOLD_LATIN: &[&str] = &[
     "C:/Windows/Fonts/segoeuib.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/system/fonts/Roboto-Bold.ttf",
 ];
 /// 衬线（拉丁部分）：Georgia 的字母有点老派编辑部的味道
 const SERIF_LATIN: &[&str] = &[
     "C:/Windows/Fonts/georgia.ttf",
     "/System/Library/Fonts/Supplemental/Georgia.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/system/fonts/NotoSerif-Regular.ttf",
 ];
 /// 等宽
 const MONO: &[&str] = &[
     "C:/Windows/Fonts/consola.ttf",
     "/System/Library/Fonts/SFNSMono.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/system/fonts/DroidSansMono.ttf",
 ];
 /// 中文无衬线
 const CJK_SANS: &[&str] = &[
@@ -93,12 +99,23 @@ const CJK_SANS: &[&str] = &[
     "/System/Library/Fonts/PingFang.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/system/fonts/NotoSansCJK-Regular.ttc",
+    "/system/fonts/DroidSansFallbackFull.ttf",
+    "/system/fonts/DroidSansFallback.ttf",
 ];
 /// 中文无衬线加粗
+///
+/// Android 上多数机器没有单独的粗体 CJK 文件（`Noto` 只给一份 `Regular.ttc`），
+/// 所以候选里接着排了 [`CJK_SANS`] 那几个：同一份文件在 [`load_role`] 里只读一次，
+/// 第二个角色直接复用，表现就是粗体位置上也用常规字重——总比缺字画方块强。
 const CJK_SANS_BOLD: &[&str] = &[
     "C:/Windows/Fonts/msyhbd.ttc",
     "/System/Library/Fonts/PingFang.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/system/fonts/NotoSansCJK-Bold.ttc",
+    "/system/fonts/NotoSansCJK-Regular.ttc",
+    "/system/fonts/DroidSansFallbackFull.ttf",
+    "/system/fonts/DroidSansFallback.ttf",
 ];
 /// 中文衬线：思源宋体 → 华文中宋 → 宋体
 const CJK_SERIF: &[&str] = &[
@@ -215,6 +232,9 @@ pub fn install_fonts(ctx: &egui::Context) {
 
     if !build_fonts(&mut fonts, &read) {
         eprintln!("未找到中文字体文件，中文可能显示为方块");
+        // Android 上 eprintln! 进不了 logcat，同一句话再走一遍日志（见 `crate::android`）
+        #[cfg(target_os = "android")]
+        log::warn!("未找到中文字体文件，中文可能显示为方块");
     }
 
     ctx.set_fonts(fonts);
@@ -246,6 +266,15 @@ pub fn install(ctx: &egui::Context) {
         style.spacing.button_padding = Vec2::new(12.0, 5.0);
         style.spacing.interact_size = Vec2::new(26.0, 24.0);
         style.spacing.menu_margin = Margin::same(8);
+
+        // Android：手指不是鼠标，可点的那几处都撑到 [`TOUCH_TARGET`]。
+        // 只动按钮与右键菜单的尺寸，刻意不动 `interact_size`：它会把单行输入框的最小高度
+        // 一起抬起来，而搜索框与密码框是自己画的 34pt 底，抬了字就偏出框。
+        #[cfg(target_os = "android")]
+        {
+            style.spacing.button_padding = Vec2::new(12.0, TOUCH_PAD_Y);
+            style.spacing.menu_margin = Margin::same(10);
+        }
         style.spacing.window_margin = Margin::same(18);
         style.spacing.indent = 18.0;
         style.spacing.scroll = egui::style::ScrollStyle {
@@ -430,8 +459,20 @@ const KEY_ABOVE: f32 = 1.19;
 const KEY_BELOW: f32 = 0.53;
 /// 幽灵按钮的左右内边距
 const BUTTON_PAD_X: f32 = 10.0;
-/// 幽灵按钮的上下内边距
-const BUTTON_PAD_Y: f32 = 6.0;
+/// 幽灵按钮的上下内边距。
+///
+/// Android 上撑到 [`TOUCH_TARGET`]：按钮那点字高（`sans_bold(12.5)` 约 16.5pt）
+/// 加上上下各一遍，正好够一只手指。桌面还是原来那个 6，顶栏高度一分没变。
+const BUTTON_PAD_Y: f32 = if cfg!(target_os = "android") {
+    TOUCH_PAD_Y
+} else {
+    6.0
+};
+
+/// 手指能稳稳按中的最小边长（Material 与 iOS HIG 给的都是 44~48）
+pub const TOUCH_TARGET: f32 = 44.0;
+/// 按 [`TOUCH_TARGET`] 反推出来的上下内边距
+const TOUCH_PAD_Y: f32 = 14.0;
 /// 状态字（[`Piece::state`]）的字距
 const STATE_TRACKING: f32 = 0.6;
 /// 竖分隔线的半高

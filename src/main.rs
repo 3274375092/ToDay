@@ -3,8 +3,7 @@
 //! 这里只做三件事——找到数据目录、打开数据库、把窗口跑起来。
 //! 它不认识 SQL，也不认识界面细节；出错了用 anyhow 报一句人话就退出。
 
-use ToDay::app::App;
-use ToDay::store::sqlite::SqliteVault;
+use ToDay::boot;
 use ToDay::ui::theme;
 use ToDay::window_state;
 use anyhow::Context as _;
@@ -13,9 +12,7 @@ use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetupCreateNew, wgpu};
 
 fn main() -> anyhow::Result<()> {
     let path = ToDay::paths::database_path().context("找不到应用数据目录")?;
-    let vault =
-        SqliteVault::open(&path).with_context(|| format!("打不开数据库 {}", path.display()))?;
-    let app = App::new(Box::new(vault)).context("日记本初始化失败")?;
+    let app = boot::assemble(&path).with_context(|| format!("打不开数据库 {}", path.display()))?;
 
     // 上一次的窗口尺寸；文件坏了就按默认来
     let window_path = ToDay::paths::window_state_path().context("找不到应用数据目录")?;

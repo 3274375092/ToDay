@@ -1,0 +1,14 @@
+<resources>
+    <!--
+      API 35 起，targetSdk 35 的应用被强制 edge-to-edge：内容会画到状态栏与手势条底下。
+      winit 0.30 不把 `MainEvent::InsetsChanged` 转给应用（源码里还是 TODO），
+      所以应用拿不到安全区，顶栏与底栏会被系统栏压住。这里退出强制 edge-to-edge，
+      让系统把这两条留着，`android:windowSoftInputMode="adjustResize"` 也才能按老规矩工作。
+      真要改成 edge-to-edge（内容画满、自己让出安全区），得先在 Rust 侧拿到 insets，
+      见 docs/android.md 的"已知取舍"。
+    -->
+    <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@color/canvas</item>
+        <item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
+    </style>
+</resources>

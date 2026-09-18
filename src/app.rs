@@ -17,7 +17,7 @@ use crate::search::{self, SearchResults};
 use crate::store::{StoreError, Vault};
 use crate::ui::calendar::Calendar;
 use crate::ui::diary::{self, Diary, DiaryEvent};
-use crate::ui::search::{Results, SearchRow, SearchView};
+use crate::ui::search::{Results, SearchAction, SearchRow, SearchView};
 use crate::ui::shell::{self, Edge, SaveState, ShellAction};
 use crate::ui::theme;
 use crate::ui::unlock::{UnlockMode, UnlockView};
@@ -211,6 +211,10 @@ pub struct App {
     error: Option<Fault>,
     /// 窗口尺寸记忆的落盘位置；不设就完全不碰窗口状态（测试与嵌入式用法）
     window_memory: Option<PathBuf>,
+    /// 窄屏浮层（搜索框 + 日历）开着没有。宽屏侧栏一直都在，这个状态没意义
+    overlay_open: bool,
+    /// 退出这个进程的执行者：手机上的返回键退到底之后走它（见 [`App::with_quit_hook`]）
+    quit: Option<Box<dyn Fn()>>,
 }
 
 impl App {
@@ -242,6 +246,8 @@ impl App {
             pending_jump: None,
             error: None,
             window_memory: None,
+            overlay_open: false,
+            quit: None,
         })
     }
 
@@ -250,6 +256,16 @@ impl App {
     /// 这是唯一开启它的入口；不开时一个字节都不会写到窗口状态文件。
     pub fn with_window_memory(mut self, path: PathBuf) -> Self {
         self.window_memory = Some(path);
+        self
+    }
+
+    /// 装上"退出进程"的执行者：手机上的返回键退到底之后由它接手（见 `crate::android`）。
+    ///
+    /// 为什么不让 `App` 自己退出：`std::process::exit` 是进程级动作，桌面与测试都不该有它；
+    /// 而"什么时候退"是导航决策，归 `App`。两边各管一半，测试里装一个探针就能验。
+    /// 不装就是不退（桌面、测试、嵌入式都一样）。
+    pub fn with_quit_hook(mut self, quit: impl Fn() + 'static) -> Self {
+        self.quit = Some(Box::new(quit));
         self
     }
 
@@ -421,6 +437,10 @@ impl App {
     /// 命中下标是某一次搜索的结果：查询改过、或上次搜索失败时它已经失效，
     /// 这时只当没点（卡片这一帧显示的也不是这些命中）。
     fn open_row(&mut self, row: SearchRow) {
+        // 窄屏：点开一行就是要看那一页正文，浮层跟着收掉（宽屏侧栏本来就在，不用动）
+        if self.overlay_open {
+            self.close_overlay();
+        }
         match row {
             SearchRow::Date(date) => {
                 self.pending_jump = None;
@@ -499,8 +519,7 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    /// 把这一帧量到的窗口尺寸写进记忆文件。
-    ///
+    /// 把这一帧量到的窗口尺寸写进记忆文件。    ///
     /// 没开记忆、或写不进去时只报一句——记不下尺寸不该影响关窗。
     fn remember_window(&self, ctx: &egui::Context) {
         let Some(path) = self.window_memory.as_deref() else {
@@ -525,6 +544,70 @@ impl App {
         if let Err(err) = window_state::remember(path, size, maximized) {
             eprintln!("窗口尺寸记不下来：{err}");
         }
+    }
+
+    /// 返回键：一层一层退，退到底就退出。
+    ///
+    /// 顺序就是用户眼里的层次：浮层 → 搜索 → 退出。退出前先落盘，写不成就留在界面上
+    /// （红条已经说明了原因），不在没写完的时候走。
+    ///
+    /// 桌面与测试可以不装退出钩子（[`App::with_quit_hook`]）：那时退到最外层就什么都不做。
+    /// 手机上这个键来自 game-activity（`KeyCode::Back` → `Key::BrowserBack`），
+    /// Activity 不会自己结束：谁都不处理它就等于这个键不存在。
+    fn handle_back(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.key_pressed(egui::Key::BrowserBack)) {
+            return;
+        }
+        if self.overlay_open {
+            self.close_overlay();
+            return;
+        }
+        if self.search.open() || !self.search.query().trim().is_empty() {
+            self.clear_search();
+            return;
+        }
+        if !self.flush() {
+            return;
+        }
+        if let Some(quit) = self.quit.as_ref() {
+            quit();
+        }
+    }
+
+    /// 开窄屏浮层。[`shell::OverlayIntent::Search`] 还要把焦点给搜索框（底栏的「搜索」按的就是它）。
+    fn open_overlay(&mut self, intent: shell::OverlayIntent) {
+        self.overlay_open = true;
+        if intent == shell::OverlayIntent::Search {
+            self.search.focus();
+        }
+    }
+
+    /// 收起窄屏浮层。查询与命中留着（下次打开原样回来），但结果卡片一起收：
+    /// 卡片挂在搜索框下沿，而浮层收掉之后这一帧就不画搜索框了，`field_rect` 停在上一帧的位置。
+    fn close_overlay(&mut self) {
+        self.overlay_open = false;
+        self.search.close();
+    }
+
+    /// `Ctrl`/`Cmd`+`F`：宽屏上侧栏本来就摆着，只把焦点给搜索框；窄屏上得先把浮层开出来。
+    fn focus_search(&mut self, narrow: bool) {
+        if narrow {
+            self.open_overlay(shell::OverlayIntent::Search);
+        } else {
+            self.search.focus();
+        }
+    }
+
+    /// 列表里的下一天：本月写过的那些天，加上今天，按日期排。
+    ///
+    /// 与日记面板那份行列表同一套判据（`Ctrl`+`Enter` 走的就是它）；手机上没有 `Ctrl`+`Enter`，
+    /// 底栏那枚「下一天」按的是同一个位置。当前这一天之后没有了就返回 `None`（按钮不画）。
+    fn next_day(&self) -> Option<NaiveDate> {
+        let today = Local::now().date_naive();
+        self.month
+            .dates()
+            .filter(|date| *date > self.date)
+            .find(|date| *date == today || self.sheet.has(*date))
     }
 
     /// 锁定：落盘之后才丢密钥。
@@ -611,19 +694,63 @@ impl App {
         }
     }
 
+    /// 窄屏浮层：搜索框 + 日历 + 页脚。
+    ///
+    /// 与宽屏左侧栏是同一份内容（同一批 widget、同一个顺序），只是容器不同。
+    /// 返回的含义与宽屏那边一样：搜索框的意图、点中的日子、日历这一帧翻没翻页。
+    fn sidebar_body(&mut self, ui: &mut egui::Ui) -> (SearchAction, Option<NaiveDate>, bool) {
+        // 底部一点暖色光晕，别让侧栏下半截太空
+        let rect = ui.max_rect();
+        theme::glow(
+            ui.painter(),
+            egui::pos2(rect.center().x, rect.bottom() + 40.0),
+            rect.width() * 1.1,
+            egui::Color32::from_rgba_unmultiplied(0xD8, 0xC7, 0x9E, 16),
+        );
+
+        // 搜索排在日历上面：
+        // 日历回答"去哪一天"，搜索回答"那句话在哪"，找一句话不必先翻到那个月
+        let action = self.search.field(ui);
+        ui.add_space(14.0);
+
+        let marked = self.sheet.marked();
+        let before = self.calendar.displayed_month();
+        let picked = self.calendar.show(ui, &marked);
+        // 页脚只有本月记录与进度条：回到今天在顶栏那枚，不在左下角重复
+        shell::sidebar_footer(ui, self.month, self.sheet.len());
+        // 翻页键与跳月的日子都在 `show` 里改日历自己那个月：
+        // 这一帧翻没翻，只有在里面比过才知道
+        (action, picked, self.calendar.displayed_month() != before)
+    }
+
     /// 主界面
     fn diary_screen(&mut self, ui: &mut egui::Ui) {
         let today = Local::now().date_naive();
         let now = ui.input(|i| i.time);
+        // 窄屏：侧栏排不下，改由底栏的「日历」「搜索」开浮层。
+        // 判据是整窗宽度（面板还没摆，`available_width` 就是全宽）
+        let narrow = ui.available_width() < shell::MOBILE_BREAKPOINT;
+        // 从窄屏转回宽屏（横屏、展开）：浮层没意义了，状态跟着收掉，
+        // 免得下次转回窄屏时凭空弹出来
+        if !narrow && self.overlay_open {
+            self.close_overlay();
+        }
+
+        // 返回键：一层一层退（浮层 → 搜索 → 退出）。桌面没有这个键，读了也恒假
+        self.handle_back(ui.ctx());
 
         // ── 搜索的快捷键与到点的那次扫库，都排在画界面之前 ──
         if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
-            self.search.focus();
+            self.focus_search(narrow);
         }
         // 卡片开着时 `Esc` 一律收起，不看焦点在不在搜索框：
         // 跳过一次之后焦点在正文那一行上，这时用户想收掉卡片也该能按 Esc。
-        // 收掉的是查询、命中与卡片，再 Ctrl+F 是从空白开始
-        if self.search.open() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // 收掉的是查询、命中与卡片，再 Ctrl+F 是从空白开始。
+        // 浮层开着的时候 `Esc` 归浮层（它自己会收，见 `Modal::should_close`）：一次按键只做一件事
+        if self.search.open()
+            && !self.overlay_open
+            && ui.input(|i| i.key_pressed(egui::Key::Escape))
+        {
             self.clear_search();
         }
         if self.search_scheduler.is_due(now) {
@@ -643,7 +770,11 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(shell::panel_padding_x(), 0)),
             )
             .show(ui, |ui| {
-                shell::top_bar(ui, self.date, today, self.save_state())
+                if narrow {
+                    shell::mobile_top_bar(ui, self.date, today, self.save_state())
+                } else {
+                    shell::top_bar(ui, self.date, today, self.save_state())
+                }
             });
         shell::edge_line(ui, bar.response.rect, Edge::Bottom);
         action = action.merge(bar.inner);
@@ -671,62 +802,74 @@ impl App {
         }
 
         // ── 底栏 ──
+        // 窄屏那条要放三枚 44pt 的按钮，比宽屏高；左右内边距也收窄一点，给按钮让位
+        let next = self.next_day();
         let bar = egui::Panel::bottom("status_bar")
-            .exact_size(shell::STATUS_BAR_HEIGHT)
+            .exact_size(if narrow {
+                shell::MOBILE_STATUS_BAR_HEIGHT
+            } else {
+                shell::STATUS_BAR_HEIGHT
+            })
             .resizable(false)
             .show_separator_line(false)
             .frame(
-                egui::Frame::NONE
-                    .fill(theme::SURFACE)
-                    .inner_margin(egui::Margin::symmetric(shell::panel_padding_x(), 0)),
-            )
-            .show(ui, |ui| shell::status_bar(ui, self.month, self.sheet.len()));
-        shell::edge_line(ui, bar.response.rect, Edge::Top);
-
-        // ── 侧栏：搜索框 + 日历 ──
-        let (month, written, marked, calendar, search) = (
-            self.month,
-            self.sheet.len(),
-            self.sheet.marked(),
-            &mut self.calendar,
-            &mut self.search,
-        );
-        let bar = egui::Panel::left("sidebar")
-            .exact_size(shell::SIDEBAR_WIDTH)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::NONE
-                    .fill(theme::SIDEBAR)
-                    .inner_margin(egui::Margin::symmetric(20, 18)),
+                egui::Frame::NONE.fill(theme::SURFACE).inner_margin(
+                    egui::Margin::symmetric(if narrow { 12 } else { shell::panel_padding_x() }, 0),
+                ),
             )
             .show(ui, |ui| {
-                // 底部一点暖色光晕，别让侧栏下半截太空
-                let rect = ui.max_rect();
-                theme::glow(
-                    ui.painter(),
-                    egui::pos2(rect.center().x, rect.bottom() + 40.0),
-                    rect.width() * 1.1,
-                    egui::Color32::from_rgba_unmultiplied(0xD8, 0xC7, 0x9E, 16),
-                );
-
-                // 搜索排在日历上面：
-                // 日历回答"去哪一天"，搜索回答"那句话在哪"，找一句话不必先翻到那个月
-                let action = search.field(ui);
-                ui.add_space(14.0);
-
-                let before = calendar.displayed_month();
-                let picked = calendar.show(ui, &marked);
-                // 页脚只有本月记录与进度条：回到今天在顶栏那枚，不在左下角重复
-                shell::sidebar_footer(ui, month, written);
-                // 翻页键与跨月的日子都在 `show` 里改日历自己那个月：
-                // 这一帧翻没翻，只有在里面比过才知道
-                (action, picked, calendar.displayed_month() != before)
+                if narrow {
+                    shell::mobile_status_bar(ui, self.sheet.len(), next)
+                } else {
+                    shell::status_bar(ui, self.month, self.sheet.len());
+                    ShellAction::default()
+                }
             });
-        shell::edge_line(ui, bar.response.rect, Edge::Right);
+        shell::edge_line(ui, bar.response.rect, Edge::Top);
+        action = action.merge(bar.inner);
+
+        // ── 侧栏：搜索框 + 日历 ──
+        // 宽屏占左边一整列；窄屏没这个宽度，同一份内容排成浮层，由底栏的「日历」「搜索」开
+        let (search_action, picked, turned) = if !narrow {
+            let bar = egui::Panel::left("sidebar")
+                .exact_size(shell::SIDEBAR_WIDTH)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::SIDEBAR)
+                        .inner_margin(egui::Margin::symmetric(20, 18)),
+                )
+                .show(ui, |ui| self.sidebar_body(ui));
+            shell::edge_line(ui, bar.response.rect, Edge::Right);
+            bar.inner
+        } else if self.overlay_open {
+            // 浮层排在结果卡片前面：卡片挂在搜索框下沿，位置来自这一帧刚画出来的那个框
+            let width = (ui.available_width() - shell::MOBILE_MARGIN_X * 2.0)
+                .clamp(shell::MOBILE_SHEET_MIN_WIDTH, shell::MOBILE_SHEET_MAX_WIDTH);
+            let modal = egui::Modal::new(egui::Id::new("sidebar_overlay"))
+                .frame(
+                    egui::Frame::window(ui.style())
+                        .fill(theme::SIDEBAR)
+                        .inner_margin(egui::Margin::symmetric(18, 16)),
+                )
+                .show(ui.ctx(), |ui| {
+                    // 日历要的宽度是固定的，先定死再排版
+                    ui.set_width(width);
+                    self.sidebar_body(ui)
+                });
+            // 点浮层外面、按 Esc 都收（`Esc` 只在它是上面那层时被吃）
+            if modal.should_close() {
+                self.close_overlay();
+            }
+            modal.inner
+        } else {
+            // 窄屏、浮层收着：这一帧既没有搜索框也没有日历。
+            // 把它们叫回来是底栏那两枚按钮的事，这里什么都不画
+            (SearchAction::default(), None, false)
+        };
 
         // 查询改了 / 被清掉：命中的存废与防抖计时都跟着走
-        let (search_action, picked, turned) = bar.inner;
         // 被清掉优先于被改过：删掉最后一个字时 `changed` 与 `dismissed` 会同时为真
         // （见 `SearchView::field` 里的 `emptied`），而清掉是更强的意图——
         // 先走它，下面那个空查询分支就不必再兼顾“查询没了”这一种情况
@@ -747,6 +890,10 @@ impl App {
         }
 
         if let Some(date) = picked {
+            // 窄屏：选完就该回正文，浮层收掉（宽屏侧栏本来就在，不用管）
+            if narrow {
+                self.close_overlay();
+            }
             // 点中的日子可能不在本月：换页交给 `go_to`（它先把旧页写完）
             self.go_to(date);
         } else if turned {
@@ -812,12 +959,20 @@ impl App {
             self.open_row(row);
         }
 
-        // ── 顶栏 / 页脚表达的意图 ──
+        // ── 顶栏 / 底栏表达的意图 ──
         if action.goto_today {
             self.go_to(today);
         }
         if action.lock {
             self.lock(ui.ctx());
+        }
+        if let Some(intent) = action.overlay {
+            self.open_overlay(intent);
+        }
+        if action.next_day
+            && let Some(date) = self.next_day()
+        {
+            self.go_to(date);
         }
 
         // 查询刚改过：排到点那一帧去搜（那次搜索在下一帧帧首）；
@@ -834,6 +989,24 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.render(ui);
     }
+
+    /// 落盘钩子：手机上切后台（`Event::Suspended`）、eframe 的自动保存、退出前都会走到这里。
+    ///
+    /// 手机上没有"关窗"这个动作，它就是"关窗前写完"的等价物；防抖（0.4 秒）不变。
+    /// 写失败不在这里报——错误已经存进 `error`，回到前台那一帧的红条会说出来。
+    /// 桌面没开 `persistence`，这个钩子一次都不会被调到（见 `docs/android.md`）。
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.flush();
+    }
+
+    /// 不把 egui 的内存写进持久化文件。
+    ///
+    /// 默认是 `true`，那会把 `TextEditState` 一起写出去：它的撤销缓冲里有一份正文，
+    /// 与"锁定即丢正文"直接冲突。Android 上 `app.ron` 因此永远是空的，只为拿到
+    /// [`eframe::App::save`] 这个钩子。
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
 }
 
 impl App {
@@ -841,6 +1014,10 @@ impl App {
     pub fn render(&mut self, ui: &mut egui::Ui) {
         self.handle_close_request(ui.ctx());
         self.flush_when_due(ui.ctx());
+        // 解锁 / 设密码界面上按返回键就是"离开这个应用"：那里没有上一层可退
+        if self.stage != Stage::Ready {
+            self.handle_back(ui.ctx());
+        }
 
         match self.stage {
             Stage::Setup | Stage::Unlock => self.password_screen(ui),

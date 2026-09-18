@@ -1,0 +1,10 @@
+<resources>
+    <!--
+      GameActivity 继承 AppCompatActivity，主题必须是 AppCompat 的后代，否则运行时直接崩。
+      NoActionBar：标题栏由 egui 自己画（顶栏那一条），系统不要再来一条。
+    -->
+    <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
+        <!-- 第一帧画出来之前显示的就是这个底色，别闪白 -->
+        <item name="android:windowBackground">@color/canvas</item>
+    </style>
+</resources>

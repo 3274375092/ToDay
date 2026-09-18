@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  纯 native 应用：Activity 用 androidx.games 的 GameActivity，入口是 .so 里的 android_main。
+  没有任何权限：日记只写在自己的私有目录里，不联网。
+
+  不复制到系统备份：今天是云备份、昨天是设备间迁移，两条路都把密文带出设备。
+  日记的承诺是"只在本机"（见 README 的"安全"一节），所以两个域一起排除。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- wgpu 优先 Vulkan，退回 GLES 3；两者都没有的机器装得上但起不来，故不设成硬性要求 -->
+    <uses-feature
+        android:glEsVersion="0x00030000"
+        android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name="com.google.androidgamesdk.GameActivity"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|density|uiMode"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@style/AppTheme"
+            android:windowSoftInputMode="adjustResize">
+            <!-- 告诉 GameActivity 去加载哪个 .so；它自己 dlsym 找里面的 android_main -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="ToDay" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

@@ -1,0 +1,6 @@
+<resources>
+    <!-- 与界面同一套暖白（theme::CANVAS）：启动那一瞬的窗口底色不该比界面白 -->
+    <color name="canvas">#FBFBFA</color>
+    <!-- 图标底：就是纸的颜色 -->
+    <color name="icon_background">#FBFBFA</color>
+</resources>

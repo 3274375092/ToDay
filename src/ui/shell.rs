@@ -15,6 +15,18 @@ pub const COLUMN_WIDTH: f32 = 720.0;
 /// 顶栏 / 底栏 / 错误条高度
 pub const TOP_BAR_HEIGHT: f32 = 58.0;
 pub const STATUS_BAR_HEIGHT: f32 = 30.0;
+/// 窄屏底栏：三枚 44pt 的按钮要装得下，比宽屏那一条高
+pub const MOBILE_STATUS_BAR_HEIGHT: f32 = 58.0;
+/// 窄屏断点：可用宽度窄于它就换一套外壳。
+///
+/// 600 是手机竖屏（360~430pt）与平板/横屏之间的常用分界；桌面窗口的最小宽度是 720，
+/// 所以桌面永远走宽屏那一套（见 `window_state::MIN_SIZE`）。
+pub const MOBILE_BREAKPOINT: f32 = 600.0;
+/// 窄屏浮层离屏幕左右各留的余量
+pub const MOBILE_MARGIN_X: f32 = 24.0;
+/// 窄屏浮层的宽度上下限：小于日历排不下，大于手幅就不好按了
+pub const MOBILE_SHEET_MIN_WIDTH: f32 = 280.0;
+pub const MOBILE_SHEET_MAX_WIDTH: f32 = 420.0;
 const ERROR_BAR_HEIGHT: f32 = 34.0;
 /// 面板左右内边距
 const PANEL_PADDING_X: i8 = 22;
@@ -35,6 +47,15 @@ pub fn panel_padding_x() -> i8 {
     PANEL_PADDING_X
 }
 
+/// 用户点了底栏上哪个按钮：两个按钮开的是同一张浮层，区别只在焦点放在哪
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayIntent {
+    /// 「日历」：浮层开在日历上
+    Calendar,
+    /// 「搜索」：浮层开出来，焦点直接给搜索框
+    Search,
+}
+
 /// 用户在界面上表达的意图。视图不改状态，只把意图交上去。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShellAction {
@@ -42,6 +63,10 @@ pub struct ShellAction {
     pub lock: bool,
     /// 点了"回到今天"
     pub goto_today: bool,
+    /// 窄屏底栏：开侧栏浮层（`None` = 这一帧没点）
+    pub overlay: Option<OverlayIntent>,
+    /// 窄屏底栏：点了"下一天"
+    pub next_day: bool,
 }
 
 impl ShellAction {
@@ -50,6 +75,9 @@ impl ShellAction {
         Self {
             lock: self.lock || other.lock,
             goto_today: self.goto_today || other.goto_today,
+            // 同一帧既点日历又点搜索是不可能的；真出现时先来的那个算数
+            overlay: self.overlay.or(other.overlay),
+            next_day: self.next_day || other.next_day,
         }
     }
 }
@@ -179,8 +207,7 @@ pub fn top_bar(ui: &mut Ui, date: NaiveDate, today: NaiveDate, state: SaveState)
 }
 
 /// 底栏：本月统计在左，键位提示在右
-pub fn status_bar(ui: &mut Ui, month: MonthKey, written: usize) {
-    ui.horizontal_centered(|ui| {
+pub fn status_bar(ui: &mut Ui, month: MonthKey, written: usize) {    ui.horizontal_centered(|ui| {
         theme::mixed(
             ui,
             &format!(
@@ -208,6 +235,90 @@ pub fn status_bar(ui: &mut Ui, month: MonthKey, written: usize) {
             ],
         );
     });
+}
+
+/// 窄屏顶栏：品牌与保存状态在左，"回到今天"与锁定在右。
+///
+/// 不摆日期戳、不摆那根竖分隔线：日期在正文的装订线里已经有了，
+/// 顶栏这点宽度留给两枚按钮。摆法与 [`top_bar`] 一样（[`theme::line`] 按基线摆）。
+pub fn mobile_top_bar(
+    ui: &mut Ui,
+    date: NaiveDate,
+    today: NaiveDate,
+    state: SaveState,
+) -> ShellAction {
+    let mut action = ShellAction::default();
+
+    ui.horizontal_centered(|ui| {
+        theme::line(
+            ui,
+            theme::Edge::Inline,
+            &[
+                theme::Piece::text("ToDay", theme::display(20.0), theme::INK_DEEP),
+                state.piece().gap(10.0),
+            ],
+        );
+
+        // 右边一簇：今天 / 回到今天、锁定。与宽屏同一个取舍：是今天就只写"今天"，不摆一枚按不动的按钮
+        let mut pieces: Vec<theme::Piece<'_>> = Vec::new();
+        let mut today_at = None;
+        if date == today {
+            pieces.push(theme::Piece::state("今天", theme::INK_DEEP).gap(10.0));
+        } else {
+            today_at = Some(pieces.len());
+            pieces.push(theme::Piece::button("回到今天").gap(10.0));
+        }
+        let lock_at = pieces.len();
+        pieces.push(theme::Piece::button("锁定"));
+
+        let responses = theme::line(ui, theme::Edge::Right, &pieces);
+        if let Some(at) = today_at
+            && let Some(response) = responses.get(at)
+            && response.clicked()
+        {
+            action.goto_today = true;
+        }
+        if let Some(response) = responses.get(lock_at)
+            && response.clicked()
+        {
+            action.lock = true;
+        }
+    });
+
+    action
+}
+
+/// 窄屏底栏：本月统计在左，三枚按钮在右。
+///
+/// 不摆键位提示：手机上没有 `Ctrl`+`Enter`、没有 `Ctrl`+`F`、也没有右键，
+/// 那三个动作改由这里的按钮与长按承担。
+/// `next` 是列表里的下一天：没有下一天时那枚按钮不画（摆一枚按不动的按钮只会让人以为坏了）。
+pub fn mobile_status_bar(ui: &mut Ui, written: usize, next: Option<NaiveDate>) -> ShellAction {
+    let mut action = ShellAction::default();
+
+    ui.horizontal_centered(|ui| {
+        theme::mixed(
+            ui,
+            &format!("本月已写 {written} 天"),
+            theme::mono(11.5),
+            theme::MUTED,
+        );
+
+        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+            // 先摆的在最右边
+            if next.is_some() && theme::ghost_button(ui, "下一天").clicked() {
+                action.next_day = true;
+            }
+            if theme::ghost_button(ui, "搜索").clicked() {
+                action.overlay = Some(OverlayIntent::Search);
+            }
+            if theme::ghost_button(ui, "日历").clicked() {
+                action.overlay = Some(OverlayIntent::Calendar);
+            }
+        });
+    });
+
+    action
 }
 
 /// 侧栏页脚：本月记录与进度条。

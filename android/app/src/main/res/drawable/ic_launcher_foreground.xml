@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 一日一记：一道墨痕，下面一道更短的淡痕（写过的那天 / 还没写的那天） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#111111"
+        android:pathData="M32,44h44a5,5 0 0 1 0,10h-44a5,5 0 0 1 0,-10z" />
+    <path
+        android:fillColor="#B9B7B2"
+        android:pathData="M32,60h26a4,4 0 0 1 0,8h-26a4,4 0 0 1 0,-8z" />
+</vector>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  云备份与设备间迁移都排除掉：日记只留在这台设备上（与 manifest 的 allowBackup="false" 同一条理由）。
+  Android 12 起设备间迁移不看 allowBackup，要看这里。
+  domain 逐个列出：root 是应用数据目录的根，file / database / sharedpref 是它下面的三个常用位置。
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+    </device-transfer>
+</data-extraction-rules>

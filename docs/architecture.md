@@ -5,18 +5,20 @@
 ## 模块图与依赖方向
 
 ```text
-main.rs              装配：找数据目录 → 开库 → 起窗口，不写 SQL 也不写布局
-  └── app.rs         控制器：策略、落盘时机、错误处理、锁定流程
-        ├── ui/      视图：只画界面，只表达意图
-        │      └── model.rs       （视图需要认识的数据形状：MonthSheet / Change）
-        └── store/   存储：Vault 接口 + SQLite 实现
-               ├── model.rs
-               ├── crypto.rs     密钥派生与字段加密
-               └── search.rs     搜索的纯数据形状与命中判定（Hit / SearchResults）
+main.rs              桌面入口：找数据目录 → 起窗口（装配交给 boot）
+android.rs           Android 入口：android_main（数据目录来自 AndroidApp，装配交给 boot）
+  └── boot.rs        装配：开库 + 建控制器，两个入口共用
+        └── app.rs   控制器：策略、落盘时机、错误处理、锁定流程、浮层与返回键导航
+              ├── ui/      视图：只画界面，只表达意图
+              │      └── model.rs       （视图需要认识的数据形状：MonthSheet / Change）
+              └── store/   存储：Vault 接口 + SQLite 实现
+                     ├── model.rs
+                     ├── crypto.rs     密钥派生与字段加密
+                     └── search.rs     搜索的纯数据形状与命中判定（Hit / SearchResults）
       model.rs       领域数据与不变量（月份边界、空白等于没写）
       crypto.rs      主密码 → 密钥 → 单字段密文
       search.rs      搜索纯逻辑：命中与摘要、日期查询（不认识 egui，不碰磁盘）
-      paths.rs       数据目录与数据库路径
+      paths.rs       数据目录与数据库路径（桌面走 directories，Android 走 set_data_dir）
       window_state.rs 窗口尺寸与最大化标志（一行文本，没有正文）
 ```
 
@@ -24,7 +26,8 @@ main.rs              装配：找数据目录 → 开库 → 起窗口，不写 
 
 - `ui/` 里不出现 `rusqlite`、不出现 `eframe`（只有 `egui` 与纯数据）；
 - `store/` 里不出现任何 `egui` 类型；
-- `main.rs` 不认识 SQL，也不认识界面细节，只做装配与错误汇报。
+- `main.rs` / `android.rs` 不认识 SQL，也不认识界面细节，只做装配与错误汇报——
+  `android.rs` 里除了日志、数据目录、退出钩子与 `NativeOptions`，没有别的业务规则。
 
 `store/` 认识 `search` 是因为 `Vault::search` 要交回 `Hit` / `SearchResults`：
 与 `model` 同一类东西——纯数据加上一个不碰磁盘的命中判定，没有反向依赖，
@@ -78,6 +81,9 @@ main.rs              装配：找数据目录 → 开库 → 起窗口，不写 
 | 搜索到点 | 先写一次（`run_search` 先 `flush`）再扫库；写失败不拦读，错误条照旧显示 |
 | 点锁定 | 立刻写，写完才丢密钥；写失败就拒绝锁定并报错 |
 | 关窗 | 先记下窗口尺寸（与正文无关，有没有待写的编辑都要记）→ 拦截 `close_requested` → 写完 → 自己再请求关闭；写失败就不关窗 |
+| 切后台（Android） | `Event::Suspended` → eframe `EventResult::Save` → `App::save` → `flush()`。手机上这是"关窗前写完"的等价物 |
+| eframe 自动保存（默认 30 秒） | 同上（只在装有 `persistence` 的目标上会调；桌面没开这个 feature，一次都不会调到） |
+| 返回键退到最外层（Android） | 先 `flush()`，写成功才退出；写失败留在界面上，红条说明原因 |
 | 错误条上的"重试" | 立刻写一次；成功则错误条消失、状态字回到"已保存"，失败则保持原样，不重排帧。编辑还压在队里时错误条上只有这一枚按钮，没有"知道了"——收起来等于把重试入口一起收走 |
 | 写盘失败 | 编辑留在队列里，不自动重试、不排帧（避免磁盘坏了忙转），等"重试"、下一次编辑或换日期／翻月份 |
 
@@ -357,6 +363,65 @@ egui 只在输入框有焦点时画选区。所以"跳到命中"不是设个光�
 第一帧画完（`post_rendering`）再 `set_visible(true)`，为的就是不闪白底。
 控制器再自己发一次既是重复的，又比"画完再显形"早，所以这件事留给 eframe，
 `main` 只负责尺寸、最小尺寸与最大化。
+
+### 为什么 Android 用 game-activity，不用 native-activity
+
+两条硬条件：Android 上的 `NativeActivity` 不支持输入法（android-activity 的 README 明说
+"no built-in input method support"），而 eframe 的 `accesskit` 只允许 game-activity
+（两者同时打开是 `compile_error!`）。一个要写中文日记的应用不可能选前者。
+
+代价是 Java 侧要多一个 `GameActivity` 壳：`androidx.games:games-activity` 提供 Activity 类，
+`libToDay.so` 里的 `android_main` 是真正的入口（manifest 用 `android.app.lib_name` 告诉它加载谁）。
+C++ glue 由 `android-activity` 自带，**不要**开 prefab（两份 glue 不兼容）。
+
+### 为什么 Android 的数据目录不走 `directories`
+
+`directories` 没有 Android 实现，落到 Linux 那套：拿 `HOME` 拼 XDG 路径。手机上 `HOME`
+要么没有要么不可写，写进去的库换个进程就找不回来。所以 `paths` 多了一个入口：
+`android_main` 把 `AndroidApp::internal_data_path()`（`/data/user/0/<包名>/files`）
+交给 `paths::set_data_dir`，此后 `data_dir()` 都返回它。
+
+同一个路径重复调用是幂等的（android-activity 可能再调一次 `android_main`）；
+换成另一个路径直接报错——同一个进程里出现两个库路径，症状是"写完看不见"。
+
+### 为什么切后台落盘挂在 `App::save` 上，而不是另接一个生命周期回调
+
+`eframe` 的 `App::save(storage)` 是手机上唯一可靠的"切后台前"钩子：
+`Event::Suspended` → `drop_window()` + `EventResult::Save` → `App::save`。
+自己接 `android-activity` 的生命周期就要把控制器从 eframe 手里拿出来，得不偿失。
+
+代价是 `persistence` feature（桌面不开），而它默认会把 egui 内存一起写出去——
+`TextEditState` 的撤销缓冲里有一份正文，与"锁定即丢正文"直接冲突。
+所以 `App::persist_egui_memory()` 返回 `false`：句柄留着，文件永远是空的。
+
+### 为什么返回键的"退出"由 `App` 发起、由入口执行
+
+"按返回键该退到哪一层"是导航决策，归控制器；`std::process::exit` 是进程级动作，
+桌面与测试都不该有它。所以两句分开：`App` 逐层退到底之后调
+[`App::with_quit_hook`](crate::app::App::with_quit_hook) 装的钩子，`android.rs` 里装的才是退出。
+测试里装一个探针就能验"什么时候该退"，而不用把测试进程也退掉。
+
+不调 `Activity::finish()` 的理由见 `docs/android.md`：winit 0.30 忽略
+`MainEvent::Destroy`，事件循环不会因 Activity 结束而结束。
+
+### 为什么窄屏只换外壳，不换视图
+
+断点（`shell::MOBILE_BREAKPOINT`）以内，顶栏、底栏、侧栏的**容器**换一套：
+侧栏从左边一整列改成居中浮层，底栏多三枚按钮。`Diary` / `Calendar` / `SearchView`
+一个都不分叉，控制器与存储的接口也不动——它们只管自己那一块画什么，
+"这块画在哪"是外壳的事。于是窄屏的每个回归点都能在无显示器环境里
+用合成事件跑出来（屏幕矩形换成 400×800 而已）。
+
+反过来，如果把"窄屏"做成另一套界面（另写一份日历、一份正文），
+两套就会各自腐化：改一处永远忘了另一处。
+
+### 为什么窄屏的日历排进 `egui::Modal`
+
+浮层要同时满足三件事：盖住正文、点外面就收、里面的控件能点。
+`Modal` 自带前两条（背板吃掉点击、`should_close()` 一次给全），第三条靠
+"排在搜索结果卡片之前"保证：两张都在 `Order::Foreground`，卡片是后建的，
+层级比较在后 → 仍可交互（搜索框下沿挂结果卡片这件事因此不用另写一套）。
+自己拿 `Area` + 背景板拼也能做，但背板与 `Esc` 的细节得自己维护。
 
 ## 测试布局
 

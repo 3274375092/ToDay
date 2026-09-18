@@ -1,8 +1,9 @@
 # ToDay
 
-一个用 Rust 写的跨平台极简日记桌面应用：每天一条纯文本记录，数据存在本机的一个 SQLite 文件里，正文逐字段加密。
+一个用 Rust 写的跨平台极简日记本（桌面 + Android）：每天一条纯文本记录，
+数据存在本机的一个 SQLite 文件里，正文逐字段加密。
 
-## 运行
+## 运行（桌面）
 
 ```bash
 cargo run
@@ -11,12 +12,28 @@ cargo run
 首次启动会让你设一个主密码（至少 8 个字符）。之后每次启动输入密码解锁。
 主密码不会保存、也没有找回入口——忘了就打不开这本日记。
 
+## 运行（Android）
+
+同一个 crate 多编一个 `cdylib`（入口是 `libToDay.so` 里的 `android_main`），
+界面、加密、表结构一行不改。需要 JDK 17、Android SDK/NDK 与 `cargo-ndk`
+（版本表在 [`docs/android.md`](docs/android.md)）：
+
+```powershell
+pwsh scripts/build-android.ps1            # 真机：arm64-v8a + debug APK
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+手机上：底栏三枚按钮（日历 / 搜索 / 下一天），侧栏是浮层，长按正文删除，
+返回键逐层退（浮层 → 搜索 → 退出）。详情与真机验收清单见 [`docs/android.md`](docs/android.md)。
+
 ## 数据
 
 - 位置：系统约定的应用数据目录，文件名固定为 `today.db`
   - Windows：`%APPDATA%\ToDay\data\today.db`
   - macOS：`~/Library/Application Support/ToDay/today.db`
   - Linux：`~/.local/share/today/today.db`（`directories` 在 Linux 上会把名字转小写）
+  - Android：`/data/user/0/com.today.diary/files/today.db`（app 私有目录，卸载即删）
+- 桌面与手机是**两个独立的库**：没有同步、没有导出，同一个主密码也打不开对方的库
 - 表结构：`entries(date, body, updated_at, format)`
   - `date` 是明文（`YYYY-MM-DD`）：日历打点和按月查询需要它
   - `body` 是密文（`nonce || ChaCha20-Poly1305 密文`），密钥由 Argon2id 从主密码派生
@@ -59,5 +76,9 @@ cargo fmt --check
 cargo clippy --all-targets
 cargo test          # 包含加密、存储、落盘策略与端到端（无需显示器）
 ```
+
+Android 那部分代码（`#[cfg(target_os = "android")]`）桌面门禁碰不到，
+单独的守卫是 `cargo ndk -t arm64-v8a build --lib`（CI 里也是这一条），
+完整打包看 [`docs/android.md`](docs/android.md)。
 
 工程准则见 [`Agents.md`](Agents.md)，模块图与决策记录见 [`docs/architecture.md`](docs/architecture.md)。

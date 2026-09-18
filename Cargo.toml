@@ -3,6 +3,11 @@ name = "ToDay"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+# 桌面是普通库 + 可执行文件；Android 的入口是 `android_main`，
+# 由 `cdylib`（`libToDay.so`）交给 Gradle 打进 APK，manifest 的 lib_name 认的也是这个名字。
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
 # 界面：eframe 起窗口，egui 画界面（ui 层只依赖后者）
 eframe = "0.36.2"
@@ -24,6 +29,17 @@ directories = "6"
 # 错误：库层用 thiserror，只有 main 汇报错误用 anyhow
 thiserror = "2"
 anyhow = "1"
+
+# Android：eframe 靠 game-activity 起窗口（默认的 accesskit 只跟它兼容，
+# 见 eframe 的 compile_error），`persistence` 只为拿到切后台时的 `App::save` 钩子，
+# 它写出来的 `app.ron` 永远是空的（`persist_egui_memory` 返回 false）。
+# winit 不在 eframe 的再导出里，而 `android_main` 的入参 `AndroidApp` 是它的类型。
+# Android 上 eprintln! 进不了 logcat，日志走 `log` + `android_logger`。
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.36.2", features = ["android-game-activity", "persistence"] }
+winit = "0.30.13"
+android_logger = "0.15"
+log = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

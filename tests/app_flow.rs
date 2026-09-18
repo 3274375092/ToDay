@@ -12,11 +12,11 @@ use ToDay::store::Vault;
 use ToDay::store::sqlite::SqliteVault;
 use ToDay::ui::search::SEARCH_FIELD_ID;
 use ToDay::ui::{diary, theme, unlock};
-use chrono::{Local, NaiveDate};
+use chrono::{Datelike as _, Local, NaiveDate};
 use egui::widgets::text_edit::TextEditState;
 use egui::{Event, Key};
 use rusqlite::Connection;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -40,6 +40,8 @@ struct Frame {
     window: Option<(egui::Rect, bool)>,
     /// 窗口是不是全屏（macOS 上那个绿色按钮给的就是这个）
     fullscreen: bool,
+    /// 屏幕矩形（点）。窄屏布局按整窗宽度分岔，而它只由 `RawInput::screen_rect` 决定
+    screen: Option<egui::Rect>,
 }
 
 fn frame(time: f64) -> Frame {
@@ -151,6 +153,22 @@ impl Frame {
         self.fullscreen = true;
         self
     }
+
+    /// 屏幕尺寸（点）。egui 不设它时默认 10000×10000，既有测试跑的就是那个“宽屏”。
+    fn screen(mut self, width: f32, height: f32) -> Self {
+        self.screen = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width, height),
+        ));
+        self
+    }
+
+    /// 返回键（Android 上 game-activity 给的 `Keycode::Back` → `Key::BrowserBack`）
+    fn back(mut self) -> Self {
+        self.events
+            .push(key_event(Key::BrowserBack, egui::Modifiers::default()));
+        self
+    }
 }
 
 /// 跑一帧，把这一帧的完整输出交出来（纹理增量自己收掉）。
@@ -166,7 +184,7 @@ fn run_output(ctx: &egui::Context, app: &mut App, frame: Frame) -> egui::FullOut
                 Vec::new()
             },
             focused: Some(frame.focused),
-            inner_rect: frame.window.map(|(rect, _)| rect),
+            inner_rect: frame.window.map(|(rect, _)| rect).or(frame.screen),
             maximized: frame.window.map(|(_, maximized)| maximized),
             fullscreen: Some(frame.fullscreen),
             ..Default::default()
@@ -177,6 +195,8 @@ fn run_output(ctx: &egui::Context, app: &mut App, frame: Frame) -> egui::FullOut
         time: Some(frame.time),
         events: frame.events,
         focused: frame.focused,
+        // 窄屏测试靠它定整窗宽度；不设时 egui 用 10000×10000（既有测试就是那个宽度）
+        screen_rect: frame.screen,
         viewports,
         ..Default::default()
     };
@@ -1455,3 +1475,206 @@ fn a_search_failure_does_not_hide_a_save_failure() {
         "搜索的错不该把写盘的错顶掉：{failed}"
     );
 }
+
+// ────────────────────────── 窄屏 / Android 外壳 ──────────────────────────
+//
+// 手机上跑的是同一套控制器与视图，只有外壳不同：侧栏收进浮层、底栏换成三枚按钮、
+// 返回键逐层退。这三条都在这里用合成事件盯着（手机没有真机也能跑）。
+
+/// 手机竖屏的屏幕尺寸（点）
+const NARROW: (f32, f32) = (400.0, 800.0);
+
+/// 窄屏的一帧
+fn narrow_frame(time: f64) -> Frame {
+    frame(time).screen(NARROW.0, NARROW.1)
+}
+
+/// 替身存储：验 `App::save`（手机上切后台时的落盘钩子）只走控制器那一侧，
+/// egui 的持久化文件里不该出现正文，所以这里也数“写了几次”。
+#[derive(Default)]
+struct DummyStorage {
+    writes: usize,
+}
+
+impl eframe::Storage for DummyStorage {
+    fn get_string(&self, _key: &str) -> Option<String> {
+        None
+    }
+
+    fn set_string(&mut self, _key: &str, _value: String) {
+        self.writes += 1;
+    }
+
+    fn remove_string(&mut self, _key: &str) {}
+
+    fn flush(&mut self) {
+        self.writes += 1;
+    }
+}
+
+/// 在 400×800 的屏上解锁进主界面
+fn open_the_narrow_diary(ctx: &egui::Context, app: &mut App) {
+    open_the_unlock_screen(ctx, app);
+    run(
+        ctx,
+        app,
+        frame(0.2)
+            .focused_on(egui::Id::new(unlock::PASSWORD_FIELD_ID))
+            .text(PASSWORD),
+    );
+    run(ctx, app, frame(0.3).enter());
+    run(ctx, app, narrow_frame(0.4));
+}
+
+/// 窄屏：侧栏收进浮层，底栏换成三枚按钮；点浮层里的一天，浮层收起、正文切过去
+#[test]
+fn a_narrow_window_moves_the_sidebar_into_an_overlay() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, _spy) = fake_app();
+    let day = today();
+    open_the_narrow_diary(&ctx, &mut app);
+
+    // 第一帧：宽屏那一列（搜索框 + 日历 + 页脚）不在画面上，底栏那三枚在
+    let first = run_output(&ctx, &mut app, narrow_frame(0.5));
+    let shown = texts(&first);
+    assert!(!shown.contains("本月记录"), "窄屏不该摆侧栏：{shown}");
+    assert!(
+        last_text_pos(&first, "日历").is_some(),
+        "底栏该有「日历」：{shown}"
+    );
+    assert!(
+        last_text_pos(&first, "搜索").is_some(),
+        "底栏该有「搜索」：{shown}"
+    );
+    assert!(shown.contains("本月已写"), "底栏该有本月统计：{shown}");
+
+    // 点「日历」：浮层开出来，搜索框与日历都在里面。
+    // 两次延迟：浮层是这一帧末尾才开的（底栏的意图排在画完之后统一处理），
+    // 而 `egui::Modal` 的第一帧还没量到自己的尺寸、什么都画不出来
+    let at = last_text_pos(&first, "日历").unwrap();
+    run_output(&ctx, &mut app, narrow_frame(0.6).click(at));
+    run_output(&ctx, &mut app, narrow_frame(0.65));
+    let opened = run_output(&ctx, &mut app, narrow_frame(0.7));
+    let shown = texts(&opened);
+    assert!(shown.contains("本月记录"), "点「日历」该开出浮层：{shown}");
+    assert!(
+        shown.contains("搜索正文或日期…"),
+        "浮层里也有搜索框：{shown}"
+    );
+
+    // 挑一个落在本月正中、又跟今天不同的日子（前后补位的格子只可能落在月初/月末）；
+    // 点完下一帧浮层收掉，那一帧里出现的这个日号只可能来自新选中的那天
+    let target = if day.day() == 17 { 16 } else { 17 };
+    let cell = last_text_pos(&opened, &target.to_string()).expect("日历上该有这一天");
+    run_output(&ctx, &mut app, narrow_frame(0.75).click(cell));
+    let picked = run_output(&ctx, &mut app, narrow_frame(0.8));
+    let shown = texts(&picked);
+    assert!(!shown.contains("本月记录"), "选完日子该收起浮层：{shown}");
+    assert!(
+        last_text_pos(&picked, &target.to_string()).is_some(),
+        "正文该切到 {target} 号：{shown}"
+    );
+}
+
+/// 返回键：浮层 → 搜索 → 退出，一次一层；退到底才交给退出钩子
+#[test]
+fn the_back_key_unwinds_one_layer_at_a_time() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (app, spy) = fake_app();
+    let quits = Rc::new(Cell::new(0));
+    let counter = Rc::clone(&quits);
+    let mut app = app.with_quit_hook(move || counter.set(counter.get() + 1));
+    spy.borrow_mut()
+        .entries
+        .insert(today(), "今天喝了咖啡".to_owned());
+    open_the_narrow_diary(&ctx, &mut app);
+
+    // 浮层开着的时候，返回键只收它：不碰搜索，也不退出
+    let calendar = last_text_pos(&run_output(&ctx, &mut app, narrow_frame(0.5)), "日历")
+        .expect("底栏该有「日历」");
+    run_output(&ctx, &mut app, narrow_frame(0.55).click(calendar));
+    run_output(&ctx, &mut app, narrow_frame(0.6));
+    let shown = texts(&run_output(&ctx, &mut app, narrow_frame(0.65)));
+    assert!(shown.contains("本月记录"), "点「日历」该开出浮层：{shown}");
+
+    let shown = texts(&run_output(&ctx, &mut app, narrow_frame(0.7).back()));
+    assert!(!shown.contains("本月记录"), "返回键该收起浮层：{shown}");
+    assert_eq!(quits.get(), 0, "只收浮层，不该退出");
+
+    // 开浮层 → 打字 → 防抖到点：命中列出来
+    // （点「搜索」是下一帧才开浮层的，所以后面看的是 0.75 那一帧）
+    let search = last_text_pos(&run_output(&ctx, &mut app, narrow_frame(0.75)), "搜索")
+        .expect("底栏该有「搜索」");
+    run_output(&ctx, &mut app, narrow_frame(0.8).click(search));
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+    run_output(
+        &ctx,
+        &mut app,
+        narrow_frame(0.85).focused_on(field).text("咖啡"),
+    );
+    let shown = texts(&run_output(&ctx, &mut app, narrow_frame(1.2).focused_on(field)));
+    assert!(shown.contains("找到 1 天"), "防抖之后该列出命中：{shown}");
+
+    // 第一下：收浮层（查询与命中都留着）
+    let shown = texts(&run_output(&ctx, &mut app, narrow_frame(1.3).back()));
+    assert!(!shown.contains("找到 1 天"), "返回键该收起浮层：{shown}");
+    assert_eq!(quits.get(), 0, "还不该退出");
+
+    // 第二下：轮到搜索那一层
+    run_output(&ctx, &mut app, narrow_frame(1.4).back());
+    assert_eq!(quits.get(), 0, "清搜索不该退出");
+
+    // 再看一眼：框里空了（提示语回来），命中也没了（浮层第二帧才画得出内容）
+    let search = last_text_pos(&run_output(&ctx, &mut app, narrow_frame(1.45)), "搜索")
+        .expect("底栏该有「搜索」");
+    run_output(&ctx, &mut app, narrow_frame(1.5).click(search));
+    run_output(&ctx, &mut app, narrow_frame(1.55));
+    let shown = texts(&run_output(&ctx, &mut app, narrow_frame(1.6)));
+    assert!(
+        shown.contains("搜索正文或日期…"),
+        "清掉搜索之后框里该是空的：{shown}"
+    );
+    assert!(!shown.contains("找到 1 天"), "命中也不该留着：{shown}");
+
+    // 收掉这个浮层，再按一次：这时搜索已经空了，返回键轮到「退出」
+    run_output(&ctx, &mut app, narrow_frame(1.65).back());
+    assert_eq!(quits.get(), 0, "收浮层不该退出");
+    run_output(&ctx, &mut app, narrow_frame(1.7).back());
+    assert_eq!(quits.get(), 1, "退到底之后交给退出钩子");
+}
+
+/// 手机切后台（eframe 的 `EventResult::Save`）走的是 `App::save`：把攒着的写完，
+/// 而 egui 的内存（含输入框撤销缓冲里的一份正文）不进持久化文件
+#[test]
+fn going_to_the_background_writes_the_pending_edits() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    let day = today();
+    open_the_diary(&ctx, &mut app);
+
+    let row = diary::row_id(day);
+    run(&ctx, &mut app, frame(0.5).focused_on(row));
+    run(
+        &ctx,
+        &mut app,
+        frame(0.6).focused_on(row).text("切后台也不能丢"),
+    );
+    assert!(spy.borrow().applied.is_empty(), "防抖期间不该写盘");
+
+    // 这就是 eframe 在 `Event::Suspended` 里做的事
+    let mut storage = DummyStorage::default();
+    eframe::App::save(&mut app, &mut storage);
+    assert_eq!(
+        spy.borrow().applied,
+        vec![vec![Change::set(day, "切后台也不能丢")]],
+        "切后台必须把攒着的写完"
+    );
+    assert_eq!(storage.writes, 0, "正文不该经过 egui 的持久化文件");
+
+    // egui 手里还有一份正文，它绝不能进 `app.ron`
+    assert!(!eframe::App::persist_egui_memory(&app));
+}
+
