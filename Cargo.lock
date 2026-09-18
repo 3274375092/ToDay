@@ -14,6 +14,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
+ "jni",
  "log",
  "rand",
  "rusqlite",

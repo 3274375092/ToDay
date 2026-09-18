@@ -102,6 +102,8 @@ const CJK_SANS: &[&str] = &[
     "/system/fonts/NotoSansCJK-Regular.ttc",
     "/system/fonts/DroidSansFallbackFull.ttf",
     "/system/fonts/DroidSansFallback.ttf",
+    // 只有衬线 CJK 的机器（少见）：总比缺字画成 `?` 强
+    "/system/fonts/NotoSerifCJK-Regular.ttc",
 ];
 /// 中文无衬线加粗
 ///
@@ -118,12 +120,20 @@ const CJK_SANS_BOLD: &[&str] = &[
     "/system/fonts/DroidSansFallback.ttf",
 ];
 /// 中文衬线：思源宋体 → 华文中宋 → 宋体
+///
+/// Android 上这条路径量过：`/system/fonts/NotoSerifCJK-Regular.ttc`（vivo / OriginOS 上有）。
+/// 没有衬线 CJK 的机器退到无衬线那一份——同一样的文件在 [`load_role`] 里只读一次，
+/// 宁可字重不对，也不要像真机上那样把每个汉字画成 `?`。
 const CJK_SERIF: &[&str] = &[
     "C:/Windows/Fonts/Source Han Serif SC Heavy (TrueType).ttf",
     "C:/Windows/Fonts/STZHONGS.TTF",
     "C:/Windows/Fonts/simsun.ttc",
     "/System/Library/Fonts/Supplemental/Songti.ttc",
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+    "/system/fonts/NotoSerifCJK-Regular.ttc",
+    "/system/fonts/NotoSansCJK-Regular.ttc",
+    "/system/fonts/DroidSansFallbackFull.ttf",
+    "/system/fonts/DroidSansFallback.ttf",
 ];
 
 /// 衬线家族名：日期、月份这类大字号走它
@@ -942,5 +952,34 @@ mod tests {
             "sans-cjk",
             "等宽的回退链复用同一份中文字体"
         );
+    }
+
+    /// 每个角色都得有中文兜底。
+    ///
+    /// 漏一条平台路径的症状是真机上把汉字画成 `?`：Android 上衬线那条就这样漏过——
+    /// Windows / macOS / Linux 都写了，就少了 `/system/fonts`。
+    /// 这里用一个"只认 Android 系统字体"的读取器跑一遍，四个家族的中文键都该在。
+    #[test]
+    fn every_role_has_a_chinese_fallback_on_android() {
+        let mut fonts = FontDefinitions::default();
+        // 真机上这些路径大多存在，所以“存在”的判定交给前缀，不在这个测试里模拟具体文件
+        let read = |path: &str| path.starts_with("/system/fonts/").then(|| vec![b'x']);
+
+        assert!(build_fonts(&mut fonts, &read), "中文那套该算装上了");
+        for family in [
+            FontFamily::Proportional,
+            FontFamily::Monospace,
+            FontFamily::Name(FAMILY_DISPLAY.into()),
+            FontFamily::Name(FAMILY_SANS_BOLD.into()),
+        ] {
+            let keys = fonts
+                .families
+                .get(&family)
+                .unwrap_or_else(|| panic!("{family:?} 一个字体都没装上"));
+            assert!(
+                keys.iter().any(|key| key.contains("cjk")),
+                "{family:?} 没有中文兜底：{keys:?}"
+            );
+        }
     }
 }

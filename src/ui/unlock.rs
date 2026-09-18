@@ -57,7 +57,10 @@ impl UnlockView {
             egui::Frame::window(ui.style())
                 .inner_margin(Margin::symmetric(28, 26))
                 .show(ui, |ui| {
-                    ui.set_width(324.0);
+                    // 卡片内容宽度：桌面上是 324（连左右内边距一共 380）；窄屏按可用宽度收窄。
+                    // 写死的话（手机屏只有 360pt）卡片会比屏幕还宽，右边连同「开始写」一起被切掉
+                    let content_width = ui.available_width().min(324.0);
+                    ui.set_width(content_width);
                     shell::wordmark(ui);
 
                     ui.add_space(22.0);

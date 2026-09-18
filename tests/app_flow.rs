@@ -16,7 +16,7 @@ use chrono::{Datelike as _, Local, NaiveDate};
 use egui::widgets::text_edit::TextEditState;
 use egui::{Event, Key};
 use rusqlite::Connection;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -212,13 +212,18 @@ fn run_output(ctx: &egui::Context, app: &mut App, frame: Frame) -> egui::FullOut
     output
 }
 
-/// 跑一帧，返回这一帧里应用向窗口提的要求（比如"先别关"和"可以关了"）。
-fn run(ctx: &egui::Context, app: &mut App, frame: Frame) -> Vec<egui::ViewportCommand> {
-    run_output(ctx, app, frame)
+/// 应用向根窗口提的要求（"先别关" / "可以关了"）
+fn commands(output: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+    output
         .viewport_output
         .get(&egui::ViewportId::ROOT)
         .map(|viewport| viewport.commands.clone())
         .unwrap_or_default()
+}
+
+/// 跑一帧，返回这一帧里应用向窗口提的要求（比如"先别关"和"可以关了"）。
+fn run(ctx: &egui::Context, app: &mut App, frame: Frame) -> Vec<egui::ViewportCommand> {
+    commands(&run_output(ctx, app, frame))
 }
 
 /// 这一帧画出来的文字，拼成一份"屏幕上有什么字"的清单
@@ -1582,29 +1587,30 @@ fn a_narrow_window_moves_the_sidebar_into_an_overlay() {
 fn the_back_key_unwinds_one_layer_at_a_time() {
     let ctx = egui::Context::default();
     theme::install(&ctx);
-    let (app, spy) = fake_app();
-    let quits = Rc::new(Cell::new(0));
-    let counter = Rc::clone(&quits);
-    let mut app = app.with_quit_hook(move || counter.set(counter.get() + 1));
+    let (mut app, spy) = fake_app();
     spy.borrow_mut()
         .entries
         .insert(today(), "今天喝了咖啡".to_owned());
     open_the_narrow_diary(&ctx, &mut app);
 
-    // 浮层开着的时候，返回键只收它：不碰搜索，也不退出
+    // 浮层开着的时候，返回键只收它：不碰搜索，也不关窗
     let calendar = last_text_pos(&run_output(&ctx, &mut app, narrow_frame(0.5)), "日历")
         .expect("底栏该有「日历」");
     run_output(&ctx, &mut app, narrow_frame(0.55).click(calendar));
     run_output(&ctx, &mut app, narrow_frame(0.6));
-    let shown = texts(&run_output(&ctx, &mut app, narrow_frame(0.65)));
-    assert!(shown.contains("本月记录"), "点「日历」该开出浮层：{shown}");
+    let opened = run_output(&ctx, &mut app, narrow_frame(0.65));
+    assert!(texts(&opened).contains("本月记录"), "点「日历」该开出浮层");
 
-    let shown = texts(&run_output(&ctx, &mut app, narrow_frame(0.7).back()));
-    assert!(!shown.contains("本月记录"), "返回键该收起浮层：{shown}");
-    assert_eq!(quits.get(), 0, "只收浮层，不该退出");
+    let output = run_output(&ctx, &mut app, narrow_frame(0.7).back());
+    assert!(
+        !texts(&output).contains("本月记录"),
+        "返回键该收起浮层：{}",
+        texts(&output)
+    );
+    assert!(commands(&output).is_empty(), "只收浮层，不该关窗");
 
     // 开浮层 → 打字 → 防抖到点：命中列出来
-    // （点「搜索」是下一帧才开浮层的，所以后面看的是 0.75 那一帧）
+    // （点「搜索」是下一帧才开浮层的，所以后面看的是 0.85 那一帧）
     let search = last_text_pos(&run_output(&ctx, &mut app, narrow_frame(0.75)), "搜索")
         .expect("底栏该有「搜索」");
     run_output(&ctx, &mut app, narrow_frame(0.8).click(search));
@@ -1622,13 +1628,17 @@ fn the_back_key_unwinds_one_layer_at_a_time() {
     assert!(shown.contains("找到 1 天"), "防抖之后该列出命中：{shown}");
 
     // 第一下：收浮层（查询与命中都留着）
-    let shown = texts(&run_output(&ctx, &mut app, narrow_frame(1.3).back()));
-    assert!(!shown.contains("找到 1 天"), "返回键该收起浮层：{shown}");
-    assert_eq!(quits.get(), 0, "还不该退出");
+    let output = run_output(&ctx, &mut app, narrow_frame(1.3).back());
+    assert!(
+        !texts(&output).contains("找到 1 天"),
+        "返回键该收起浮层：{}",
+        texts(&output)
+    );
+    assert!(commands(&output).is_empty(), "还不该关窗");
 
     // 第二下：轮到搜索那一层
-    run_output(&ctx, &mut app, narrow_frame(1.4).back());
-    assert_eq!(quits.get(), 0, "清搜索不该退出");
+    let output = run_output(&ctx, &mut app, narrow_frame(1.4).back());
+    assert!(commands(&output).is_empty(), "清搜索不该关窗");
 
     // 再看一眼：框里空了（提示语回来），命中也没了（浮层第二帧才画得出内容）
     let search = last_text_pos(&run_output(&ctx, &mut app, narrow_frame(1.45)), "搜索")
@@ -1642,11 +1652,16 @@ fn the_back_key_unwinds_one_layer_at_a_time() {
     );
     assert!(!shown.contains("找到 1 天"), "命中也不该留着：{shown}");
 
-    // 收掉这个浮层，再按一次：这时搜索已经空了，返回键轮到「退出」
-    run_output(&ctx, &mut app, narrow_frame(1.65).back());
-    assert_eq!(quits.get(), 0, "收浮层不该退出");
-    run_output(&ctx, &mut app, narrow_frame(1.7).back());
-    assert_eq!(quits.get(), 1, "退到底之后交给退出钩子");
+    // 收掉这个浮层，再按一次：这时搜索已经空了，返回键轮到「关窗」
+    // （关窗就是桌面点关闭按钮那条路：先落盘、写不成就不关，由 `handle_close_request` 管）
+    let output = run_output(&ctx, &mut app, narrow_frame(1.65).back());
+    assert!(commands(&output).is_empty(), "收浮层不该关窗");
+    let output = run_output(&ctx, &mut app, narrow_frame(1.7).back());
+    assert!(
+        commands(&output).contains(&egui::ViewportCommand::Close),
+        "退到底该请求关窗：{:?}",
+        commands(&output)
+    );
 }
 
 /// 手机切后台（eframe 的 `EventResult::Save`）走的是 `App::save`：把攒着的写完，
@@ -1680,4 +1695,85 @@ fn going_to_the_background_writes_the_pending_edits() {
 
     // egui 手里还有一份正文，它绝不能进 `app.ron`
     assert!(!eframe::App::persist_egui_memory(&app));
+}
+
+/// 输入法上屏的字（Android 的 JNI 桥推进队列）要变成这一帧的文本事件。
+///
+/// 这一条盯的是手写不出来的那条路：软键盘的字在手机上根本不走键盘事件，
+/// 全靠 `push_text` → `raw_input_hook` → `Event::Text` 这一段。
+#[test]
+fn text_pushed_by_the_ime_bridge_lands_in_the_focused_row() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    let day = today();
+    open_the_diary(&ctx, &mut app);
+    let row = diary::row_id(day);
+
+    // 焦点先落在今天那一行（真实运行时是用户点一下）
+    run(&ctx, &mut app, frame(0.5).focused_on(row));
+
+    // Java 侧刚推了一段中文进来，接着就是 eframe 的一帧：先 `raw_input_hook`，再画
+    ToDay::app::push_text("中文".to_owned());
+    let mut input = egui::RawInput {
+        time: Some(0.6),
+        focused: true,
+        ..Default::default()
+    };
+    eframe::App::raw_input_hook(&mut app, &ctx, &mut input);
+    assert!(
+        input
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Text(text) if text == "中文")),
+        "推给队列的字该变成这一帧的文本事件：{:?}",
+        input.events
+    );
+
+    let mut output = ctx.run_ui(input, |ui| {
+        ui.memory_mut(|memory| memory.request_focus(row));
+        app.render(ui);
+    });
+    output.textures_delta.clear();
+
+    // 防抖到点：这一句应该已经落进"库"里
+    run(&ctx, &mut app, frame(1.1).focused_on(row));
+    assert_eq!(
+        spy.borrow().entries.get(&day).map(String::as_str),
+        Some("中文"),
+        "输入法上屏的字该写进库"
+    );
+
+    // 输入法的退格也要走得通：它到底也是 `deleteSurroundingText`，不是键盘事件
+    ToDay::app::push_backspace(1);
+    let mut input = egui::RawInput {
+        time: Some(1.2),
+        focused: true,
+        ..Default::default()
+    };
+    eframe::App::raw_input_hook(&mut app, &ctx, &mut input);
+    assert!(
+        input.events.iter().any(|event| matches!(
+            event,
+            Event::Key {
+                key: Key::Backspace,
+                pressed: true,
+                ..
+            }
+        )),
+        "退格该变成按键事件：{:?}",
+        input.events
+    );
+    let mut output = ctx.run_ui(input, |ui| {
+        ui.memory_mut(|memory| memory.request_focus(row));
+        app.render(ui);
+    });
+    output.textures_delta.clear();
+
+    run(&ctx, &mut app, frame(1.7).focused_on(row));
+    assert_eq!(
+        spy.borrow().entries.get(&day).map(String::as_str),
+        Some("中"),
+        "退格该删掉一个字"
+    );
 }

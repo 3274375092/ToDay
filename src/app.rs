@@ -31,6 +31,49 @@ use std::time::Duration;
 /// 打字安静多久之后落盘
 pub const SAVE_DEBOUNCE_SECONDS: f64 = 0.4;
 
+/// 输入法上屏的动作：Android 那边 Java 的 `InputConnection` 经 JNI 推到这里。
+///
+/// 为什么需要它：winit 0.30.13 的 Android 后端不消费 game-activity 的 `TextEvent`，
+/// 而软键盘敲出来的字与退格只走那条路——不接这一手，手机上就一个字也输不进去
+/// （真机验证过，见 `docs/android.md`）。桌面没人往里放，这一层就是空转。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingInput {
+    /// 上屏的文字
+    Text(String),
+    /// 光标左边删掉几个字符（输入法的退格）
+    Backspace(usize),
+}
+
+static PENDING_INPUT: std::sync::Mutex<Vec<PendingInput>> = std::sync::Mutex::new(Vec::new());
+
+/// 推一段输入法上屏的文字。
+///
+/// 可能在任意线程被调（Android 上是 Java 的 UI / Binder 线程）：这里只入队，
+/// 不碰 `egui`、不碰任何一个 [`App`]。真正的注入在 [`App::raw_input_hook`] 里。
+/// 取走发生在下一帧开始之前，所以同一段输入只会用上一次。
+pub fn push_text(text: String) {
+    if let Ok(mut queue) = PENDING_INPUT.lock() {
+        queue.push(PendingInput::Text(text));
+    }
+}
+
+/// 推一次退格（输入法在光标左边删掉了 `count` 个字符）。
+pub fn push_backspace(count: usize) {
+    if count > 0
+        && let Ok(mut queue) = PENDING_INPUT.lock()
+    {
+        queue.push(PendingInput::Backspace(count));
+    }
+}
+
+/// 取走这一帧之前攒下的输入（[`App::raw_input_hook`] 调）。
+fn take_input() -> Vec<PendingInput> {
+    PENDING_INPUT
+        .lock()
+        .map(|mut queue| std::mem::take(&mut *queue))
+        .unwrap_or_default()
+}
+
 /// 查询安静多久之后真的去搜一次
 pub const SEARCH_DEBOUNCE_SECONDS: f64 = 0.25;
 
@@ -213,8 +256,6 @@ pub struct App {
     window_memory: Option<PathBuf>,
     /// 窄屏浮层（搜索框 + 日历）开着没有。宽屏侧栏一直都在，这个状态没意义
     overlay_open: bool,
-    /// 退出这个进程的执行者：手机上的返回键退到底之后走它（见 [`App::with_quit_hook`]）
-    quit: Option<Box<dyn Fn()>>,
 }
 
 impl App {
@@ -247,7 +288,6 @@ impl App {
             error: None,
             window_memory: None,
             overlay_open: false,
-            quit: None,
         })
     }
 
@@ -256,16 +296,6 @@ impl App {
     /// 这是唯一开启它的入口；不开时一个字节都不会写到窗口状态文件。
     pub fn with_window_memory(mut self, path: PathBuf) -> Self {
         self.window_memory = Some(path);
-        self
-    }
-
-    /// 装上"退出进程"的执行者：手机上的返回键退到底之后由它接手（见 `crate::android`）。
-    ///
-    /// 为什么不让 `App` 自己退出：`std::process::exit` 是进程级动作，桌面与测试都不该有它；
-    /// 而"什么时候退"是导航决策，归 `App`。两边各管一半，测试里装一个探针就能验。
-    /// 不装就是不退（桌面、测试、嵌入式都一样）。
-    pub fn with_quit_hook(mut self, quit: impl Fn() + 'static) -> Self {
-        self.quit = Some(Box::new(quit));
         self
     }
 
@@ -546,14 +576,17 @@ impl App {
         }
     }
 
-    /// 返回键：一层一层退，退到底就退出。
+    /// 返回键：一层一层退，退到底就把窗口关掉。
     ///
-    /// 顺序就是用户眼里的层次：浮层 → 搜索 → 退出。退出前先落盘，写不成就留在界面上
-    /// （红条已经说明了原因），不在没写完的时候走。
+    /// 顺序就是用户眼里的层次：浮层 → 搜索 → 关窗。
     ///
-    /// 桌面与测试可以不装退出钩子（[`App::with_quit_hook`]）：那时退到最外层就什么都不做。
-    /// 手机上这个键来自 game-activity（`KeyCode::Back` → `Key::BrowserBack`），
-    /// Activity 不会自己结束：谁都不处理它就等于这个键不存在。
+    /// 退到底时发的是 [`egui::ViewportCommand::Close`]，也就是桌面点关闭按钮那一条路：
+    /// 落盘、写失败就不关，全由 [`App::handle_close_request`] 管。手机上 `android_main`
+    /// 因此返回到 `android-activity`，由它调 `GameActivity_finish()` 结束 Activity。
+    /// **不能在这里 `std::process::exit`**：真机上那样会在错误线程上拆 JVM，直接 SIGABRT
+    /// （见 `docs/android.md` 的"返回键与退出"）。
+    ///
+    /// 桌面基本碰不到这个键（有些键盘有），碰到了也当"关闭窗口"，语义一致。
     fn handle_back(&mut self, ctx: &egui::Context) {
         if !ctx.input(|input| input.key_pressed(egui::Key::BrowserBack)) {
             return;
@@ -566,12 +599,7 @@ impl App {
             self.clear_search();
             return;
         }
-        if !self.flush() {
-            return;
-        }
-        if let Some(quit) = self.quit.as_ref() {
-            quit();
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     /// 开窄屏浮层。[`shell::OverlayIntent::Search`] 还要把焦点给搜索框（底栏的「搜索」按的就是它）。
@@ -996,6 +1024,30 @@ impl eframe::App for App {
     /// 桌面没开 `persistence`，这个钩子一次都不会被调到（见 `docs/android.md`）。
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
         self.flush();
+    }
+
+    /// 输入法上屏的字：Android 的 JNI 桥推进 [`PENDING_TEXT`]，这里注入成 `egui` 的文本事件。
+    ///
+    /// `eframe` 每帧画之前调它（`prepare_raw_input`），所以注入的字和这一帧的键盘事件
+    /// 走同一条路：该落的输入框、该动的光标都跟手敲的一样。桌面队列永远是空的。
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        for input in take_input() {
+            match input {
+                PendingInput::Text(text) => raw_input.events.push(egui::Event::Text(text)),
+                // 退格造一个按键事件：文本编辑器认的就是它，与手敲退格没有区别
+                PendingInput::Backspace(count) => {
+                    for _ in 0..count {
+                        raw_input.events.push(egui::Event::Key {
+                            key: egui::Key::Backspace,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::default(),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// 不把 egui 的内存写进持久化文件。

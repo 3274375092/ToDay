@@ -9,7 +9,9 @@
 //! * **数据目录**：`directories` 没有 Android 实现，路径从 `AndroidApp::internal_data_path()` 拿，
 //!   交给 [`crate::paths::set_data_dir`]（`/data/user/0/<包名>/files`，app 私有，卸载即删）。
 //! * **日志**：Android 上 `eprintln!` 进不了 logcat，日志走 `log` + `android_logger`。
-//! * **退出**：没有可关的窗口，返回键的"退出"由 [`crate::app::App::with_quit_hook`] 收到这里执行。
+//! * **退出**：手机上关不掉窗口，返回键退到底时 `App` 发 `ViewportCommand::Close`；
+//!   `run_native` 返回之后本函数就返回，`android-activity` 的 springboard 会接下去调
+//!   `GameActivity_finish()` 把 Activity 正常结束——**不要自己 `std::process::exit`**（见下方注释）。
 //!
 //! 不碰窗口尺寸记忆（[`crate::window_state`]）：手机上只有一个全屏窗口，`window.txt` 没有意义。
 
@@ -62,15 +64,14 @@ pub fn android_main(android_app: AndroidApp) {
             return;
         }
     };
+    // 返回键退到底之后走的就是桌面那条"关窗"路：App 发 `Close`，`handle_close_request`
+    // 先把待写的写完（写不成就不关），事件循环退出，本函数返回，
+    // 然后 `android-activity` 自己调 `GameActivity_finish()`。
+    //
+    // 真机上量过：在这里（或任何地方）用 `std::process::exit` 收尾会在错误线程上拆 JVM，
+    // 直接 `JNI DETECTED ERROR` + `SIGABRT`。见 `docs/android.md` 的"返回键与退出"。
     let app = match boot::assemble(&path) {
-        Ok(app) => app.with_quit_hook(|| {
-            log::info!("返回键退出：待写的编辑已经落盘");
-            // TODO: 若真机上最近任务里残留卡片，改成 JNI 调 `Activity::finish()`。
-            // 之所以不是 finish()：winit 的 Android 后端忽略 `MainEvent::Destroy`
-            // （源码里是 TODO，见 docs/android.md），事件循环不会因此结束，
-            // 而本进程只有这一个 Activity，进程随键一起走最干净。
-            std::process::exit(0);
-        }),
+        Ok(app) => app,
         Err(err) => {
             log::error!("打不开数据库 {}：{err}", path.display());
             return;
@@ -106,5 +107,43 @@ pub fn android_main(android_app: AndroidApp) {
         }),
     ) {
         log::error!("窗口起不来：{err}");
+    }
+}
+
+/// 输入法上屏的文字入口，由 Java 的 `ToDayActivity.nativePushText` 调。
+///
+/// 符号名是 JNI 的规矩：`Java_<包名下划线化>_<类名>_<方法名>`；静态方法与实例方法
+/// 第二个参数分别是 `JClass` / `JObject`——这里是静态的。改名要三处一起改
+/// （Java 的 native 声明、这里的符号名、`docs/android.md`）。
+///
+/// 线程：Java 的 UI 线程（不是 `android_main` 那条），所以只做一次加锁入队；
+/// 注入到 `egui` 是 [`crate::app::App::raw_input_hook`] 的事。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_today_diary_ToDayActivity_nativePushText<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    text: jni::objects::JString<'local>,
+) {
+    // 取字符串失败只记一条日志（policy 会打），当这一手没推过——不能让输入法崩在这里
+    let text: String = env
+        .with_env(|env| -> jni::errors::Result<String> { text.try_to_string(env) })
+        .resolve::<jni::errors::LogErrorAndDefault>();
+
+    if !text.is_empty() {
+        crate::app::push_text(text);
+    }
+}
+
+/// 退格入口，由 Java 的 `ToDayActivity.nativePushBackspace` 调（输入法在光标左边删字）。
+///
+/// 与 [`Java_com_today_diary_ToDayActivity_nativePushText`] 同一条线程规矩：只入队。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_today_diary_ToDayActivity_nativePushBackspace(
+    _env: jni::EnvUnowned<'_>,
+    _class: jni::objects::JClass<'_>,
+    count: jni::sys::jint,
+) {
+    if count > 0 {
+        crate::app::push_backspace(count as usize);
     }
 }

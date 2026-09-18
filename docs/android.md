@@ -10,10 +10,24 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 编译与打包 | 本机验证过：`cargo ndk` + `gradlew assembleDebug` 出 `app-debug.apk`（16.2 MB；`lib/arm64-v8a/libToDay.so` 与两个 dex 都在包里，manifest 合并结果里的包名 / Activity / `lib_name` / `allowBackup=false` / `adjustResize` 都对了） |
-| 静态检查 | 本机验证过：`cargo ndk -t arm64-v8a clippy --lib -- -D warnings` 与 `RUSTDOCFLAGS=-D warnings cargo ndk -t arm64-v8a doc --no-deps` 都干净 |
-| 装机、真机行为 | **没有验证过**：写这份文档的机器上没有真机。`adb install` 与下面那份"真机验收清单"要有人跑一遍才算 |
-| 中文（拼音）输入 | **待定**：winit 0.30.13 的 Android 后端只处理 `MotionEvent` / `KeyEvent`，不消费 game-activity 的 `TextEvent`（源码 `platform_impl/android/mod.rs` 里 `InputEvent` 只认前两者）。它只从 `KeyCharacterMap` 反查按键字符，而输入法的合成文本不走这条路 —— 所以拼音候选上屏**很可能收不到**。真机的结论决定要不要做 JNI 桥，见下面"中文输入" |
+| 编译与打包 | 本机验证过：`cargo ndk` + `gradlew assembleDebug` 出 `app-debug.apk`（16~29 MB；`lib/arm64-v8a/libToDay.so` 与两个 dex 都在包里，manifest 合并结果里的包名 / Activity / `lib_name` / `allowBackup=false` / `adjustResize` 都对了） |
+| 静态检查 | 本机验证过：桌面三道门禁 + `cargo ndk -t arm64-v8a clippy --lib -- -D warnings` 与 `cargo ndk doc` 都干净 |
+| 真机（vivo V2453A / OriginOS，Android 16） | 启动、渲染（Vulkan / Adreno 825）、中文字体、系统栏、软键盘弹出、`adjustResize`、返回键退出、无崩溃 —— 都验证过，见下方"真机上验过什么" |
+| 中文（拼音）输入 | 桥已做（见"中文输入"）：软键盘上屏的字现在走 Java 的 `InputConnection` → JNI → egui。Rust 那半有测试盯着，**真机上要用手指敲一遍才算数**（我盲点不到候选栏） |
+
+## 真机上验过什么
+
+设备：vivo V2453A（OriginOS，Android 16，1260×2800 / density 560）。
+
+| 项 | 结论 |
+| --- | --- |
+| 启动与渲染 | ✓ `egui_wgpu` 选到 Vulkan / Adreno 825（备选 GLES 3.2），首帧不闪白底 |
+| 中文字体 | ✓ 无方块：`/system/fonts/NotoSansCJK-Regular.ttc`（无衬线）与 `NotoSerifCJK-Regular.ttc`（衬线）都在，两条候选路径都补上了 |
+| 系统栏 | ✓ 内容没有被状态栏与手势条压住（`values-v35` 那句退出强制 edge-to-edge 生效了） |
+| 软键盘 | ✓ 点输入框就弹（`mInputShown=true`），窗口跟着键盘缩（`adjustResize` + `windowSoftInputMode`），卡片没被挡住 |
+| 键盘的字能不能进应用 | ✗ **进不来**：软键盘的字走 `InputConnection.commitText` → game-activity 的 `TextEvent`，而 winit 0.30.13 不消费它（注入的 `KeyEvent` 也不行：winit 对没有 `KeyCharacterMap` 的虚拟设备反查不出字符）。这是本轮最大的发现，修法见"中文输入" |
+| 返回键退出 | ✓ 干净退出，崩溃缓冲区 0 条；Activity 结束、前台回桌面；重开时同一个进程里重新起 `android_main`（数据还在） |
+| 崩溃 | ✓ `adb logcat -b crash` 全程 0 条（修之前 `std::process::exit` 那条路是 `SIGABRT`） |
 
 ## 工具链
 
@@ -127,22 +141,50 @@ Android 目标上开，桌面没有这个钩子，行为一字不变）。
 ## 返回键与退出
 
 返回键（`Keycode::Back` → winit 的 `Key::Named(BrowserBack)` → egui 的 `Key::BrowserBack`）
-逐层退：**浮层 → 搜索 → 退出**。
+逐层退：**浮层 → 搜索 → 关窗**；键盘开着时那一下先收键盘（Android 的规矩，不是应用拦的）。
 
-退到最外层时由 `App::with_quit_hook` 装的钩子执行 `std::process::exit(0)`（`android.rs`）。
-两件事先说清楚：
+退到底时 `App::handle_back` 发的是 [`egui::ViewportCommand::Close`]，也就是桌面点关闭按钮那条路：
+`handle_close_request` 先把待写的写完（写不成就不关），事件循环退出 → `run_native` 返回 →
+`android_main` 返回 → **`android-activity` 的 springboard 自己调 `GameActivity_finish()`**
+把 Activity 正常结束。
 
-- **Activity 不会自己结束**：winit 对非音量键一律返回 `InputStatus::Handled`，
-  系统收不到"这个返回键没人处理"，所以不会自己 finish。
-- **为什么不调 `Activity::finish()`**：android-activity 的文档确实不建议在 `android_main` 里
-  `process::exit`，但它给的替代路径要反过来依赖 winit 转发 Activity 的生命周期 —— 而 winit 0.30.13
-  的 Android 后端**忽略** `MainEvent::Destroy`（源码里是 TODO），事件循环不会因为 Activity 结束而结束：
-  本进程只有一个 Activity，进程跟着键一起走最干净。数据已经落盘（commit 过的 WAL 不怕进程退）。
+**不要在这里 `std::process::exit`。** 第一版就是这么写的，真机上直接崩：
 
-`TODO:` 真机上如果发现最近任务里留下残影卡片，改成 JNI 调 `Activity::finish()`。
-触发条件写在 `src/android.rs` 的退出钩子旁边。
+```
+I ToDay  : 返回键退出：待写的编辑已经落盘
+F ...: JNI DETECTED ERROR: thread "android_main" using JNIEnv* from thread "main"
+F libc  : Fatal signal 6 (SIGABRT)
+```
 
-## 中文输入（待真机确认）
+进程退出会去拆 JVM 与 C++ 静态对象，而那时 Java 的 UI 线程还在跑（hwui 死锁 + JNIEnv 跨线程误用）。
+android-activity 的文档也明确说别这么干；它给的替代路就是"让 `android_main` 返回"。
+
+代价：关窗后进程会留在后台（Android 正常行为），重开时在同一个进程里重新起 `android_main`——
+真机上验过，重开正常、数据还在。
+
+## 中文输入（JNI 桥）
+
+真机上量到的链路：软键盘（搜狗）敲字 → 输入法弹候选 → 选中 → 输入法调 `InputConnection.commitText`
+→ game-activity 的 `GameTextInput` → `TextEvent` → **winit 0.30.13 不消费**（源码里 `InputEvent` 的 match
+只认 `MotionEvent` / `KeyEvent`，其余只打一条 warn）→ 应用一个字也收不到。
+注入的 `KeyEvent` 也不行：winit 的角色反查靠设备的 `KeyCharacterMap`，虚拟设备（`input keyevent`）查不到。
+
+所以字必须从 Java 侧接：
+
+1. `android/app/src/main/java/com/today/diary/ToDayActivity.java`
+   —— 继承 `GameActivity`，在 `createSurfaceView()` 里换成自己的 SurfaceView，交出去一份
+   `gametextinput.InputConnection` 的子类：`commitText` 与 `deleteSurroundingText`
+   各推一次 native（`nativePushText` / `nativePushBackspace`），两份都照旧调 `super`
+   （GameActivity 自己那份状态要跟输入法保持一致）。
+   AGDK 的语义要注意：软键盘没被请求显示时 `onCreateInputConnection` **就返回 null**，
+   窗口刚拿到焦点时输入法先来问一次——照旧返回 null，别自作聪明。
+2. `src/android.rs` —— 两个 `#[unsafe(no_mangle)] extern "system"` 入口，只做加锁入队
+   （可能在 Java 的 UI 线程被调，绝不在那里碰 egui）。
+3. `src/app.rs` —— `push_text` / `push_backspace` 入队，[`App::raw_input_hook`](crate::app::App::raw_input_hook)
+   每帧取走并注入 `egui::Event::Text` / `egui::Event::Key { Backspace }`（eframe 官方给输入注入留的口子）。
+   退格也造按键事件，是因为输入法退格走的也是 `deleteSurroundingText`，不是键盘事件。
+
+不做 pre-edit（组词下划线）：组词期间的字不进正文，上屏时才进——日记只要"字进得来"。
 
 直觉上应该能行的地方：点中输入框时 egui 通过 `set_ime_allowed(true)` → winit 的
 `show_soft_input(true)` 把软键盘弹出来，键盘上的字母键走 `KeyEvent` → `KeyCharacterMap` → ASCII 能进。
@@ -186,11 +228,11 @@ Android 目标上开，桌面没有这个钩子，行为一字不变）。
 
 装机之后按这个顺序过一遍（每条都要有结论，结论回填到本节）：
 
-- [ ] 首次启动 → 设主密码（≥8 字符）→ 进主界面，不闪白底（`adb logcat -s ToDay` 看得到启动日志）
-- [ ] 中文不显示方块（`/system/fonts` 里找得到 CJK 字体；看不到就是"已知取舍"里那条）
-- [ ] 顶栏与底栏没有被状态栏 / 手势条压住（内容能点得到）
-- [ ] 点正文 → 软键盘弹出；打 ASCII 能进
-- [ ] 打中文（拼音）：候选上屏进不进得来 ← **这条决定要不要做 JNI 桥**
+- [x] 首次启动 → 设主密码（≥8 字符）→ 进主界面，不闪白底（`adb logcat -s ToDay` 看得到启动日志）
+- [x] 中文不显示方块（vivo 上有 `NotoSansCJK` 与 `NotoSerifCJK`）
+- [x] 顶栏与底栏没有被状态栏 / 手势条压住（内容能点得到）
+- [x] 点正文 → 软键盘弹出
+- [ ] **打中文（拼音）：候选上屏进不进得来** ← JNI 桥做好后待人验（Rust 侧有测试盯着）
 - [ ] 打字 → 立刻按 Home 切后台 → 再回来：字没丢，光标与滚动位置还在
 - [ ] 杀进程（最近任务里划掉）→ 重开 → 数据还在
 - [ ] 点"锁定" → 回解锁界面；再解锁回来，正文重新出现
@@ -199,7 +241,7 @@ Android 目标上开，桌面没有这个钩子，行为一字不变）。
       跳到那天、命中那句被选中
 - [ ] 底栏「日历」→ 浮层弹出（键盘不弹）→ 点某天：浮层收起、正文切到那天
 - [ ] 底栏「下一天」跳到下一个写过的日子；本月后面没有记录时这枚按钮不出现
-- [ ] 返回键：浮层开着先收浮层 → 再按清掉搜索 → 再按退出应用（任务列表里不留卡片）
+- [x] 返回键：浮层开着先收浮层 → 再按清掉搜索 → 再按退出应用（Activity 正常结束、不复现 SIGABRT）
 - [ ] 切后台再回来不会重新弹解锁界面（与桌面一致：不自动锁）
 - [ ] `adb exec-out run-as com.today.diary cat files/today.db > today.db` 之后，
       在文件里搜不到正文的明文
@@ -212,8 +254,15 @@ Android 目标上开，桌面没有这个钩子，行为一字不变）。
 - **系统栏**：`targetSdk 35` 会被强制 edge-to-edge，而 winit 0.30 不把 insets 转给应用，
   所以 `values-v35/themes.xml` 里关掉了这条强制（`android:windowOptOutEdgeToEdgeEnforcement`）。
   想让内容画满屏幕就得先在 Rust 侧拿到安全区，那是另一轮的事。
-- **字体不打包**：用系统那一份（省 10~16 MB）。系统里没有 CJK 字体时中文是方块，
-  日志里会有一条 warn（`未找到中文字体文件`）。真机上出方块就改成打包一份。
+- **字体不打包**：用系统那一份（省 10~16 MB）。系统里没有 CJK 字体时中文是方块或 `?`，
+  日志里会有一条 warn（`未找到中文字体文件`）。
+  真机上踩过一个反面例子：**衬线（`display`）那条候选链只写了桌面路径**，
+  于是标题「先设一个主密码」渲染成 `???????`（七个字七个问号）——因为 `NotoSerifCJK` 在
+  `/system/fonts/` 下，而候选表里没写。现在四条角色（含衬线、含 sans-bold）都有 Android 兜底，
+  并且有一条测试盯着"每个角色都真的能排出中文"（`every_role_has_a_chinese_fallback_on_android`）。
+- **输入法的回车/换行行为没单独验**：候选上屏与退格都接了，但输入法那颗回车键是走
+  `sendKeyEvent` 还是 `performEditorAction` 没在真机上看过——输密码靠「开始写」按钮，
+  正文里换行还没人试过。
 - **触摸目标**：按钮 ≥44pt，但日历格子（42pt 高）与搜索框（34pt 高）比 44 小一点：
   它们按视觉密度定的高，单独抬会让日历一屏放不下。
 - **后台不自动锁定**：与桌面一致（锁定是用户动作）。最近任务里的截图可能露出正文，

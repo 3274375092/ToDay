@@ -22,7 +22,7 @@
         android:theme="@style/AppTheme">
 
         <activity
-            android:name="com.google.androidgamesdk.GameActivity"
+            android:name="com.today.diary.ToDayActivity"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|density|uiMode"
             android:exported="true"
             android:launchMode="singleTask"
