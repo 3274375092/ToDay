@@ -22,7 +22,7 @@ use crate::boot;
 use crate::paths;
 use crate::ui::theme;
 use eframe::egui;
-use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetupCreateNew, wgpu};
+use eframe::egui_wgpu::{SurfaceConfig, WgpuConfiguration, WgpuSetupCreateNew, wgpu};
 use jni::JavaVM;
 use jni::objects::JObject;
 use std::ffi::c_void;
@@ -102,6 +102,10 @@ pub fn android_main(android_app: AndroidApp) {
         multisampling: 0,
         wgpu_options: WgpuConfiguration {
             wgpu_setup: setup.into(),
+            // 手机上只留一帧在排：`LOW_LATENCY` = `AutoVsync` + `desired_maximum_frame_latency:
+            // Some(1)`（默认的 2 会让这一帧在队列里多等一个 present，上屏延迟里就多一帧）。
+            // 垂直同步照旧，只是不再多存一帧。
+            surface: SurfaceConfig::LOW_LATENCY,
             ..Default::default()
         },
         android_app: Some(android_app),

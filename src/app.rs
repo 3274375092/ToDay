@@ -230,6 +230,9 @@ pub struct App {
     ime_kind: Option<ImeKind>,
     /// 上一次快照里“已经上屏”的正文（组词区不算），下一次差分拿它当基准
     ime_committed: String,
+    /// 只在 debug 构建里存在的量尺（见 `ImeStats`）；release 下整个字段不存在
+    #[cfg(all(target_os = "android", debug_assertions))]
+    ime_stats: ImeStats,
 }
 
 impl App {
@@ -271,6 +274,8 @@ impl App {
             #[cfg(target_os = "android")]
             ime_kind: None,
             ime_committed: String::new(),
+            #[cfg(all(target_os = "android", debug_assertions))]
+            ime_stats: ImeStats::default(),
         })
     }
 
@@ -298,7 +303,11 @@ impl App {
     /// 把一份输入法快照差分进这一帧要注入的事件里。
     ///
     /// `text` 是输入法眼里的完整正文（含组词区），`compose` 是组词区的字节下标；
-    /// 差分规则与边界在 [`crate::ime::injections`]。返回值不回传：基准更新在 `ime_committed`。
+    /// 差分规则与边界在 [`crate::ime::injections`]。基准更新在 `ime_committed`。
+    ///
+    /// 返回**这一次快照差分出了动作没有**（新上屏 / 退格，哪怕随后被退格去重挡掉）：
+    /// 测试用它区分“输入法真的推了东西”与“只是同一份快照又喂了一遍”。排帧不看它——
+    /// 判据是“有没有输入框在焦点上”，见 [`crate::ime::next_interval`] 里量到的理由。
     ///
     /// 调用时序由 `eframe` 定：每帧画之前调一次（[`eframe::App::raw_input_hook`]），
     /// 所以这里塞进去的事件与同一帧的键盘事件走同一条路。同一段字只在它变化的那一帧
@@ -311,9 +320,10 @@ impl App {
         raw_input: &mut egui::RawInput,
         text: &str,
         compose: Option<(usize, usize)>,
-    ) {
+    ) -> bool {
         let (actions, committed) = crate::ime::injections(&self.ime_committed, text, compose);
         self.ime_committed = committed;
+        let injected = !actions.is_empty();
 
         // 这一帧已经收到键盘的退格时不再补退格：输入法删字可能既走 `sendKeyEvent`
         // （→ winit → `Key::Backspace`）又改快照，两边都注入就一按删两个字
@@ -346,6 +356,37 @@ impl App {
                 crate::ime::Injection::Backspace(_) => {}
             }
         }
+        injected
+    }
+
+    /// 输入法这一帧：把一份快照差分进 `raw_input`，再决定这一帧要不要接着画。
+    ///
+    /// Android 上每帧由 [`eframe::App::raw_input_hook`] 喂一次真实快照
+    /// （读法在 `crate::android::ime_snapshot`，这里是它唯一的正式调用方；那个模块只在
+    /// Android 目标上编译，所以这里不写成文档链接）。
+    /// 桌面没有输入法源，`tests/app_flow.rs` 的合成帧测试直接调这个方法——走的是
+    /// 同一条路，只是快照由测试造。
+    ///
+    /// `snapshot` 为 `None` = 这一帧没读到（句柄还没到手、输入法还没推过东西、
+    /// 或不是 Android）：基准 `ime_committed` 一个字都不动——**不要**因为没读到
+    /// 就把基准清空，那会在下一次读到时把整段旧正文重新倒进输入框。
+    ///
+    /// 返回这一帧排下的间隔（`None` = 这一帧不排帧）；规则与它的真机依据在
+    /// [`crate::ime::next_interval`]。
+    pub fn ime_frame(
+        &mut self,
+        ctx: &egui::Context,
+        raw_input: &mut egui::RawInput,
+        snapshot: Option<(&str, Option<(usize, usize)>)>,
+    ) -> Option<Duration> {
+        if let Some((text, compose)) = snapshot {
+            self.apply_ime_snapshot(raw_input, text, compose);
+        }
+        let interval = crate::ime::next_interval(ctx.text_edit_focused());
+        if let Some(delay) = interval {
+            ctx.request_repaint_after(delay);
+        }
+        interval
     }
 
     /// 解锁成功之后进入主界面：读今天所在的那一页
@@ -1062,8 +1103,15 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// 一帧的绘制。外面只多一层 `ImeStats` 的量尺（只在 debug 构建的 Android 上存在）。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(all(target_os = "android", debug_assertions))]
+        let started = std::time::Instant::now();
+
         self.render(ui);
+
+        #[cfg(all(target_os = "android", debug_assertions))]
+        self.ime_stats.record_draw(started.elapsed(), ui.ctx());
     }
 
     /// 落盘钩子：手机上切后台（`Event::Suspended`）、eframe 的自动保存、退出前都会走到这里。
@@ -1076,14 +1124,19 @@ impl eframe::App for App {
     }
 
     /// 输入法上屏的字：Android 的软键盘不走 `KeyEvent`，它的 `TextEvent` 又不被 winit 消费，
-    /// 所以这里每帧读一次 game-activity 的文本快照，与上一帧比出差量，注入成 `egui` 事件。
+    /// 所以这里每帧读一次 game-activity 的文本快照，交给 [`App::ime_frame`] 差分、注入、排帧。
     ///
     /// `eframe` 每帧画之前调它（`prepare_raw_input`），所以注入的字和这一帧的键盘事件
     /// 走同一条路：该落的输入框、该动的光标都跟手敲的一样。
     /// 桌面没有输入法源（`App::with_ime_source` 是 Android 独有），这里是空转。
     fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {
         #[cfg(target_os = "android")]
-        self.inject_ime_events(_ctx, _raw_input);
+        {
+            self.cap_render_scale(_ctx);
+            if self.ime_source.is_some() {
+                self.read_ime_snapshot(_ctx, _raw_input);
+            }
+        }
     }
 
     /// 不把 egui 的内存写进持久化文件。
@@ -1096,46 +1149,63 @@ impl eframe::App for App {
     }
 }
 
-/// Android 独有：从 game-activity 读输入法快照。
+/// Android 独有：从 game-activity 读输入法快照、封顶渲染倍率。
 ///
-/// 差分与注入在 [`App::apply_ime_snapshot`]，这里负责“把快照读出来”、
-/// “告诉输入法当前是什么输入框”与“该画的时候画一帧”。
+/// 差分、注入与排帧节奏在 [`App::ime_frame`]（平台无关），这里负责“把快照读出来”、
+/// “告诉输入法当前是什么输入框”与“别用屏幕原生的像素密度画”。
 #[cfg(target_os = "android")]
 impl App {
-    /// 有输入框在焦点上时多久自己排一帧。
+    /// 渲染倍率的上限（每 pt 多少物理像素）。
     ///
-    /// 输入法上屏不会给应用发任何 winit 事件（字只进 game-activity 的快照），
-    /// 不自己排帧的话，一段上屏的字要等到下一次别的输入才画出来。
-    /// 200 毫秒是人眼看上去“跟手”的上限，也是这条取舍的代价：打字期间每秒多画几帧。
-    const IME_POLL_MILLIS: u64 = 200;
+    /// 屏幕原生是 3.5（1260×2800 / density 560），一帧要画 1260×2800 像素；
+    /// 哪天真撑不住帧预算，这里就是最划算的那一刀（布局单位是 pt，字与格子大小一律不变，
+    /// 只是光栅化细一点；再往下降就是 3.0 → 2.5）。
+    ///
+    /// 3.5 = **不封顶**，真机上量过才定下的：3.5 时连着打字与弹浮层都是 121 帧/2s
+    /// （60Hz 满帧）、没有一帧超过一个 vsync，所以不用降。
+    const MAX_PIXELS_PER_POINT: f32 = 3.5;
 
     /// 取 native handle 的重试上限（帧数）。前面的 SQLite 打开与迁移已经把
     /// `initializeNativeCode` 那点“先起 `android_main`、后写静态字段”的窗口盖过去了，
     /// 实际上第一次就拿到；这个上限只是别让它在异常情况下每帧去问 JNI。
     const IME_HANDLE_TRIES: u32 = 120;
 
-    /// 读一次输入法快照，交给 [`App::apply_ime_snapshot`]，并安排下一次读。
+    /// 把渲染倍率封到 [`Self::MAX_PIXELS_PER_POINT`]，下一帧生效。
+    ///
+    /// 每帧调都安全：值已经等于上限时 `egui` 自己短路（`Context::set_pixels_per_point`
+    /// 第一句就是拿当前值比一下），值变了才落成 `zoom_factor`。**不要在帧中间改**：
+    /// 那会让这一帧的布局与光栅化用两个倍率（所以放在 `raw_input_hook` 里——
+    /// 它在下一次 `begin_pass` 之前）。
+    fn cap_render_scale(&self, ctx: &egui::Context) {
+        let native = ctx.native_pixels_per_point().unwrap_or(1.0);
+        let capped = native.min(Self::MAX_PIXELS_PER_POINT);
+        if capped < native {
+            ctx.set_pixels_per_point(capped);
+        }
+    }
+
+    /// 读一次输入法快照，交给 [`App::ime_frame`] 差分、注入并排下一帧。
     ///
     /// 快照的读法在 [`crate::android::ime_snapshot`]（只读，不改状态）：**不要**换成
     /// `AndroidApp::text_input_state()`——它内部那个读法在输入法还没推过东西时会 `abort`。
-    /// 取不到 handle 或这一次读不出来就什么都不做，下一帧再试（只读不清标志，不会丢字）。
-    fn inject_ime_events(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if self.ime_source.is_none() {
-            return;
-        }
-        // 有没有输入框在等着打字。**不要**读 `ctx.output()`：帧外读到的是被 take 走的空输出
-        // （`ime` 永远是 `None`）。`text_edit_focused` 是"有焦点、且是 TextEdit"。
-        let want_ime = ctx.text_edit_focused();
+    /// 取不到 handle 或这一次读不出来就什么都不做，下一帧再试（只读不清标志，不会丢字）；
+    /// 排帧只看焦点，与这一次读到没读到无关（见 [`App::ime_frame`]）。
+    fn read_ime_snapshot(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.ensure_ime_handle();
         self.sync_ime_editor_info();
 
-        if let Some((text, compose)) = self.ime_handle.and_then(crate::android::ime_snapshot) {
-            self.apply_ime_snapshot(raw_input, &text, compose);
-        }
-
-        if want_ime {
-            ctx.request_repaint_after(Duration::from_millis(Self::IME_POLL_MILLIS));
-        }
+        let snapshot = self.ime_handle.and_then(crate::android::ime_snapshot);
+        #[cfg(debug_assertions)]
+        self.ime_stats.record_snapshot();
+        let interval = self.ime_frame(
+            ctx,
+            raw_input,
+            snapshot
+                .as_ref()
+                .map(|(text, compose)| (text.as_str(), *compose)),
+        );
+        #[cfg(debug_assertions)]
+        self.ime_stats.record_tier(interval);
     }
 
     /// 拿到 AGDK 的 native handle（一次就够，同一个进程里它是不变的）。
@@ -1191,6 +1261,193 @@ impl App {
         }
         source.set_ime_editor_info(want.input_type(), ImeKind::ACTION, ImeKind::OPTIONS);
         self.ime_kind = Some(want);
+    }
+}
+
+/// 只在 debug 构建的 Android 上存在的量尺（`adb logcat -s ToDay` 每 [`Self::WINDOW_SECONDS`]
+/// 秒一行汇总）。
+///
+/// 量的是这一轮改动的判据：
+///
+/// * egui 这一趟画了多久（p50 / p95 / 最长）与**两帧之间的间隔**（p50 / p95 / 最长、
+///   超过一个 vsync 的帧数）——渲染倍率要不要封顶看后者（`dumpsys gfxinfo` 认不出
+///   SurfaceView 里 Vulkan 画的帧，真机上它只数到个位数，所以只有应用自己量）；
+/// * 连续两次读输入法快照的**最大间隔**——上屏延迟的上界：字进了快照之后最多等这么久
+///   才被读走、才算进 `egui`；
+/// * 当前排帧档位（画 / 停）与窗口尺寸变化的次数；
+/// * 这一帧的焦点与 IME 请求（窗口焦点 / 控件焦点 / 给 eframe 的 `ime`）——
+///   真机上"键盘弹不出来"到底是应用没要还是系统收了，看这一行。
+///
+/// 另有三类单帧日志：窗口尺寸变化那一帧、绘制 ≥ [`Self::SLOW_FRAME_MS`] 的帧、
+/// 间隔 ≥ [`Self::LONG_INTERVAL_MS`] 的帧——“长帧与尺寸变化那一帧重合”就是键盘 resize
+/// 那一下的代价（要不要改成不 resize 看它，结论在 `docs/android.md` 的“已知取舍”）。
+///
+/// release 构建里这个结构整个不存在（字段上的 `cfg` 与它一致），一条日志都不留。
+#[cfg(all(target_os = "android", debug_assertions))]
+#[derive(Default)]
+struct ImeStats {
+    /// 汇总窗口的起点（`None` = 还没开始）
+    window_start: Option<std::time::Instant>,
+    /// 本窗口每一帧的绘制耗时（毫秒）
+    draws_ms: Vec<f32>,
+    /// 本窗口每一帧与上一帧的间隔（毫秒）
+    intervals_ms: Vec<f32>,
+    /// 上一帧的时刻（量间隔用）
+    last_frame: Option<std::time::Instant>,
+    /// 上一次读快照的时刻
+    last_read: Option<std::time::Instant>,
+    /// 本窗口里两次读快照的最大间隔（毫秒）。`0.0` = 还没量到两次
+    max_gap_ms: f32,
+    /// 本窗口里最后一次排帧决策
+    tier: &'static str,
+    /// 上一帧的窗口矩形（点）
+    last_rect: Option<egui::Rect>,
+    /// 本窗口里窗口尺寸变了几次
+    rect_changes: u32,
+    /// 最近一帧的焦点 / IME 状态（“键盘为什么不弹”看这一行）
+    focus_note: String,
+}
+
+#[cfg(all(target_os = "android", debug_assertions))]
+impl ImeStats {
+    /// 汇总周期（秒）
+    const WINDOW_SECONDS: f32 = 2.0;
+
+    /// 算“慢帧”的门槛（毫秒）：这台设备的 vsync 周期是 60Hz（16.7ms），
+    /// 1.5 倍以上就是一眼能看出的一次顿。
+    const SLOW_FRAME_MS: f32 = 25.0;
+
+    /// 算“长间隔”的门槛（毫秒）：超过一个 vsync 周期（16.7ms）就没接上趟。
+    /// 汇总里按 [`Self::DROPPED_AFTER_MS`] 算掉帧，单帧日志只记更长的
+    /// （免得打字时每帧都写一行）。
+    const DROPPED_AFTER_MS: f32 = 33.0;
+
+    /// 单帧记一条的间隔门槛（毫秒）
+    const LONG_INTERVAL_MS: f32 = 100.0;
+
+    /// 记一帧的绘制耗时与它距上一帧的间隔；窗口尺寸变了或这一帧长得刺眼时额外记一行。
+    fn record_draw(&mut self, draw: Duration, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        let draw_ms = draw.as_secs_f32() * 1000.0;
+        self.draws_ms.push(draw_ms);
+
+        let interval_ms = self
+            .last_frame
+            .map(|prev| now.duration_since(prev).as_secs_f32() * 1000.0);
+        if let Some(interval_ms) = interval_ms {
+            self.intervals_ms.push(interval_ms);
+        }
+        self.last_frame = Some(now);
+
+        // 窗口矩形（点）：键盘弹出/收起会改它（`adjustResize`），所以尺寸变化也能当判据
+        let rect = ctx.input(|input| input.viewport_rect());
+        let resized = self
+            .last_rect
+            .is_some_and(|prev| prev.size() != rect.size());
+        if resized {
+            self.rect_changes += 1;
+            log::info!(
+                "窗口尺寸变化：{:.0}×{:.0}pt → {:.0}×{:.0}pt；这一帧画了 {draw_ms:.1}ms，距上一帧 {:?}",
+                self.last_rect.unwrap_or(rect).width(),
+                self.last_rect.unwrap_or(rect).height(),
+                rect.width(),
+                rect.height(),
+                interval_ms.map(|ms| format!("{ms:.0}ms")),
+            );
+        } else if draw_ms >= Self::SLOW_FRAME_MS {
+            log::info!(
+                "慢帧：画了 {draw_ms:.1}ms（距上一帧 {:?}）",
+                interval_ms.map(|ms| format!("{ms:.0}ms"))
+            );
+        } else if interval_ms.is_some_and(|ms| ms >= Self::LONG_INTERVAL_MS) {
+            log::info!(
+                "长间隔：距上一帧 {:.0}ms（这一帧画了 {draw_ms:.1}ms，档位 {}）",
+                interval_ms.unwrap_or_default(),
+                self.tier,
+            );
+        }
+        self.last_rect = Some(rect);
+
+        // 应用这一侧到底在不在要键盘：窗口焦点来自 winit，控件焦点来自 egui，
+        // `ime` 是给 eframe 的那份平台输出（`Some` = 请求显示/保持软键盘）
+        self.focus_note = format!(
+            "窗口焦点={} 控件焦点={} ime={:?}",
+            ctx.input(|input| input.focused),
+            ctx.text_edit_focused(),
+            ctx.output(|output| output.ime),
+        );
+
+        if self.window_start.is_none() {
+            self.window_start = Some(now);
+        }
+        self.report_if_due();
+    }
+
+    /// 记一次读快照；两次读之间的间隔就是“字在快照里最多躺多久”。
+    fn record_snapshot(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_read {
+            self.max_gap_ms = self
+                .max_gap_ms
+                .max(now.duration_since(last).as_secs_f32() * 1000.0);
+        }
+        self.last_read = Some(now);
+    }
+
+    /// 记下这一帧排帧决策落在哪一档。
+    fn record_tier(&mut self, interval: Option<Duration>) {
+        self.tier = if interval.is_some() { "画" } else { "停" };
+    }
+
+    /// 到点就写一行汇总，然后清空窗口。
+    fn report_if_due(&mut self) {
+        let Some(started) = self.window_start else {
+            return;
+        };
+        let elapsed = started.elapsed();
+        if elapsed.as_secs_f32() < Self::WINDOW_SECONDS {
+            return;
+        }
+
+        let mut sorted = std::mem::take(&mut self.draws_ms);
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // 样本少时取最后一个（不是插值），够用：这是量尺，不是报表
+        let pick = |values: &[f32], q: f32| -> f32 {
+            if values.is_empty() {
+                return 0.0;
+            }
+            let index = ((values.len() - 1) as f32 * q).round() as usize;
+            values[index]
+        };
+        let mut intervals = std::mem::take(&mut self.intervals_ms);
+        intervals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let dropped = intervals
+            .iter()
+            .filter(|ms| **ms >= Self::DROPPED_AFTER_MS)
+            .count();
+        log::info!(
+            "量尺 {:.1}s：帧 {}；绘制 p50 {:.1}ms / p95 {:.1}ms / 最长 {:.1}ms；\
+             间隔 p50 {:.0}ms / p95 {:.0}ms / 最长 {:.0}ms（≥{:.0}ms {} 帧）；\
+             读快照最大间隔 {:.1}ms；档位 {}；尺寸变化 {} 次；{}",
+            elapsed.as_secs_f32(),
+            sorted.len(),
+            pick(&sorted, 0.5),
+            pick(&sorted, 0.95),
+            sorted.last().copied().unwrap_or(0.0),
+            pick(&intervals, 0.5),
+            pick(&intervals, 0.95),
+            intervals.last().copied().unwrap_or(0.0),
+            Self::DROPPED_AFTER_MS,
+            dropped,
+            self.max_gap_ms,
+            self.tier,
+            self.rect_changes,
+            self.focus_note,
+        );
+
+        self.max_gap_ms = 0.0;
+        self.rect_changes = 0;
+        self.window_start = Some(std::time::Instant::now());
     }
 }
 

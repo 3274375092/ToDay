@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const PASSWORD: &str = "正确的马电池订书钉";
@@ -173,6 +174,21 @@ impl Frame {
 
 /// 跑一帧，把这一帧的完整输出交出来（纹理增量自己收掉）。
 fn run_output(ctx: &egui::Context, app: &mut App, frame: Frame) -> egui::FullOutput {
+    run_ime(ctx, app, frame, None).0
+}
+
+/// 上面那条的完整版：`ime` 是这一帧先喂给 [`App::ime_frame`] 的输入法快照
+/// （`None` = 不跑输入法那一趟，与桌面运行一致）。
+///
+/// 顺序照抄 eframe 的 `prepare_raw_input`：**先**跑输入法那一趟（`raw_input_hook`），
+/// 再把同一份 `RawInput` 交给 `egui` 画——注入的事件因此和这一帧的键盘事件走同一条路。
+/// 返回这一帧的输出与 [`App::ime_frame`] 排下的间隔（`None` = 这一帧不排帧）。
+fn run_ime(
+    ctx: &egui::Context,
+    app: &mut App,
+    frame: Frame,
+    ime: Option<(&str, Option<(usize, usize)>)>,
+) -> (egui::FullOutput, Option<Duration>) {
     // egui 要求每个 RawInput 都带上当前视口的信息
     let mut viewports = egui::ViewportIdMap::default();
     viewports.insert(
@@ -191,7 +207,7 @@ fn run_output(ctx: &egui::Context, app: &mut App, frame: Frame) -> egui::FullOut
         },
     );
 
-    let input = egui::RawInput {
+    let mut input = egui::RawInput {
         time: Some(frame.time),
         events: frame.events,
         focused: frame.focused,
@@ -200,6 +216,8 @@ fn run_output(ctx: &egui::Context, app: &mut App, frame: Frame) -> egui::FullOut
         viewports,
         ..Default::default()
     };
+    let paced = ime.and_then(|snapshot| app.ime_frame(ctx, &mut input, Some(snapshot)));
+
     let mut output = ctx.run_ui(input, |ui| {
         if let Some(id) = frame.focus {
             // 键盘焦点由测试投递：没法用鼠标点，就直接告诉 egui 谁拿着焦点
@@ -209,7 +227,7 @@ fn run_output(ctx: &egui::Context, app: &mut App, frame: Frame) -> egui::FullOut
     });
     output.textures_delta.clear();
 
-    output
+    (output, paced)
 }
 
 /// 应用向根窗口提的要求（"先别关" / "可以关了"）
@@ -1817,5 +1835,139 @@ fn ime_text_lands_in_the_focused_row() {
         spy.borrow().entries.get(&day).map(String::as_str),
         Some("中"),
         "退格该删掉一个字"
+    );
+}
+
+/// 差分有没有产出动作：排帧不看它（判据是焦点），但这一层唯一的可观测产物就是它——
+/// “快照真的推了字”与“同一份快照又喂了一遍”靠它分开。
+#[test]
+fn ime_injections_report_whether_something_was_committed() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, _spy) = fake_app();
+    let mut input = egui::RawInput::default();
+
+    assert!(
+        app.apply_ime_snapshot(&mut input, "中文", None),
+        "新上屏的字算一次动作"
+    );
+    assert!(
+        !app.apply_ime_snapshot(&mut input, "中文", None),
+        "同一份快照重复喂不产出动作"
+    );
+    assert!(
+        !app.apply_ime_snapshot(&mut input, "中文nihao", Some((6, 11))),
+        "只有组词区在变（拼音打在候选里）不算上屏"
+    );
+    assert!(
+        app.apply_ime_snapshot(&mut input, "中", None),
+        "输入法退格算一次动作"
+    );
+}
+
+/// 装上排帧回调，返回它看到的那些延迟。
+///
+/// `eframe` 真实运行时用的就是它（回调里按 `delay` 排一次 `UserEvent::RequestRepaint`），
+/// 所以"排帧请求到底发出去没有"要在这里看：`raw_input_hook` 在 pass 之前跑，
+/// `viewport_output.repaint_delay` 只装得下 pass 里的那些请求。
+fn repaint_requests(ctx: &egui::Context) -> Arc<Mutex<Vec<Duration>>> {
+    let seen: Arc<Mutex<Vec<Duration>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    ctx.set_request_repaint_callback(move |info| sink.lock().unwrap().push(info.delay));
+    seen
+}
+
+/// 打字时应用要自己排帧：上屏的字不给应用发事件，不排帧就一直不上屏。
+///
+/// 判据只有焦点一个：有输入框在焦点上就**立刻**再画一帧（为什么不是"16ms 一帧"，见
+/// `ToDay::ime::next_interval` 的注释——真机上非零延迟会被帧内的排帧请求吃掉）。
+#[test]
+fn ime_typing_requests_another_frame_right_away() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, _spy) = fake_app();
+    open_the_diary(&ctx, &mut app);
+    let row = diary::row_id(today());
+
+    // 焦点先落在今天那一行（真实运行时是用户点一下）
+    run_ime(&ctx, &mut app, frame(0.5).focused_on(row), None);
+    assert!(
+        ctx.text_edit_focused(),
+        "夹具的前提：这一行真的拿着输入焦点"
+    );
+
+    let asked = repaint_requests(&ctx);
+    asked.lock().unwrap().clear();
+
+    // 一次新上屏：这一帧就把下一帧排到"立刻"。`repaint_delay` 是 egui 给这一帧的
+    // "下一帧最早什么时候"，它已经把这一帧里所有的排帧请求（含上面那次）算进去了
+    let (out, paced) = run_ime(
+        &ctx,
+        &mut app,
+        frame(0.6).focused_on(row),
+        Some(("中", None)),
+    );
+    assert_eq!(
+        paced,
+        Some(Duration::ZERO),
+        "有输入框在焦点上：立刻排下一帧"
+    );
+    assert_eq!(
+        out.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+        Duration::ZERO,
+        "这一帧的下一帧要排到立刻"
+    );
+
+    // 停手之后照样：上屏的字随时可能到，非零延迟在真机上不可靠，所以不看"多久没输入"
+    let mut asked_last = Vec::new();
+    for step in 0..5 {
+        asked.lock().unwrap().clear();
+        let (_out, paced) = run_ime(
+            &ctx,
+            &mut app,
+            frame(1.0 + step as f64 * 0.5).focused_on(row),
+            Some(("中", None)),
+        );
+        assert_eq!(paced, Some(Duration::ZERO), "有焦点就一直排帧");
+        asked_last = asked.lock().unwrap().clone();
+    }
+    assert!(
+        asked_last.iter().all(|delay| *delay == Duration::ZERO),
+        "排出去的也只能是立刻：{asked_last:?}"
+    );
+}
+
+/// 没有输入框在焦点上时不排帧：空闲一帧都不多画（与接手前一致）。
+///
+/// 快照照样每帧喂（Android 那条路也是）：基准 `ime_committed` 要保持新鲜，否则重新聚焦时
+/// 会把整段旧正文重新倒进输入框——不排帧 ≠ 不读快照。
+#[test]
+fn without_a_focused_editor_no_repaint_is_scheduled() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, _spy) = fake_app();
+    open_the_diary(&ctx, &mut app);
+    assert!(!ctx.text_edit_focused(), "夹具的前提：没有输入框拿到焦点");
+
+    let asked = repaint_requests(&ctx);
+    asked.lock().unwrap().clear();
+    for step in 0..3 {
+        // 快照喂空：既不产出注入，也没人接注入（没焦点）——纯空闲
+        let (_out, paced) = run_ime(
+            &ctx,
+            &mut app,
+            frame(0.5 + step as f64 * 0.1),
+            Some(("", None)),
+        );
+        assert_eq!(paced, None, "没有输入框在焦点上：这一帧不排帧");
+    }
+    assert!(
+        asked
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|delay| *delay > Duration::from_millis(50)),
+        "没焦点时不该出现立刻排帧的请求：{:?}",
+        asked.lock().unwrap()
     );
 }
