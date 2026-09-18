@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  纯 native 应用：Activity 用 androidx.games 的 GameActivity，入口是 .so 里的 android_main。
+  纯 native 应用：Activity 直接用 androidx.games 的 GameActivity，入口是 .so 里的 android_main。
   没有任何权限：日记只写在自己的私有目录里，不联网。
+
+  不要为了接输入法再子类化 GameActivity：4.4.0 的 `InputConnection.setSoftKeyboardActive`
+  末尾会无条件调 `InputMethodManager.restartInput`，在 `onCreateInputConnection` 里
+  调它就会递归到 `StackOverflowError`（见 docs/android.md 的"中文输入"）。
 
   不复制到系统备份：今天是云备份、昨天是设备间迁移，两条路都把密文带出设备。
   日记的承诺是"只在本机"（见 README 的"安全"一节），所以两个域一起排除。
@@ -22,7 +26,7 @@
         android:theme="@style/AppTheme">
 
         <activity
-            android:name="com.today.diary.ToDayActivity"
+            android:name="com.google.androidgamesdk.GameActivity"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|density|uiMode"
             android:exported="true"
             android:launchMode="singleTask"

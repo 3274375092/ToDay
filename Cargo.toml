@@ -33,16 +33,18 @@ anyhow = "1"
 # Android：eframe 靠 game-activity 起窗口（默认的 accesskit 只跟它兼容，
 # 见 eframe 的 compile_error），`persistence` 只为拿到切后台时的 `App::save` 钩子，
 # 它写出来的 `app.ron` 永远是空的（`persist_egui_memory` 返回 false）。
-# winit 不在 eframe 的再导出里，而 `android_main` 的入参 `AndroidApp` 是它的类型。
+# winit 不在 eframe 的再导出里，而 `android_main` 的入参 `AndroidApp` 是它的类型，
+# 输入法快照也是通过它拿的（见 `src/android.rs`）。
 # Android 上 eprintln! 进不了 logcat，日志走 `log` + `android_logger`。
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { version = "0.36.2", features = ["android-game-activity", "persistence"] }
 winit = "0.30.13"
 android_logger = "0.15"
 log = "0.4"
-# 把输入法上屏的字从 Java 侧接过来（`ToDayActivity.onCreateInputConnection` → `nativePushText`）；
-# android-activity 已经把它拉进依赖树，这里只是显式用上
+# 读 game-activity 的文本状态：`jni` 取 AGDK 的 native handle，`simd_cesu8` 解它给的
+# modified UTF-8（BMP 之外的字在标准 UTF-8 里解不出来）。两个都已是依赖树里的版本。
 jni = "0.22"
+simd_cesu8 = "1"
 
 [dev-dependencies]
 tempfile = "3"

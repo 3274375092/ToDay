@@ -15,6 +15,7 @@ pub mod android;
 pub mod app;
 pub mod boot;
 pub mod crypto;
+pub mod ime;
 pub mod model;
 pub mod paths;
 pub mod search;

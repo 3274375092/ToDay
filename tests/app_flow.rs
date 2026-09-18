@@ -1582,6 +1582,48 @@ fn a_narrow_window_moves_the_sidebar_into_an_overlay() {
     );
 }
 
+/// 空页提示得指对地方：窄屏的日历收在底栏「日历」那枚按钮开的浮层里，
+/// 宽屏的日历在正文左边一整列。面板自己不看宽度（见 `docs/architecture.md`），
+/// 文案由外壳给的 `Chrome` 带进来。
+#[test]
+fn the_empty_month_hint_points_at_wherever_the_calendar_is() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, _spy) = fake_app();
+    open_the_narrow_diary(&ctx, &mut app);
+
+    // 翻到下个月：库里那个月没有记录，正文这一页就空了。
+    // 浮层是点开之后第二帧才画得出来的（`egui::Modal` 要量一次尺寸）
+    let calendar = last_text_pos(&run_output(&ctx, &mut app, narrow_frame(0.5)), "日历")
+        .expect("底栏该有「日历」");
+    run_output(&ctx, &mut app, narrow_frame(0.55).click(calendar));
+    run_output(&ctx, &mut app, narrow_frame(0.6));
+    let opened = run_output(&ctx, &mut app, narrow_frame(0.65));
+    let next = last_text_pos(&opened, "›").expect("浮层里该有翻到下个月那枚按钮");
+    run_output(&ctx, &mut app, narrow_frame(0.7).click(next));
+
+    let narrow = texts(&run_output(&ctx, &mut app, narrow_frame(0.75)));
+    assert!(narrow.contains("还没有记录"), "翻到空月该给提示：{narrow}");
+    assert!(
+        narrow.contains("点底栏「日历」挑一天"),
+        "窄屏的日历在浮层里：{narrow}"
+    );
+    assert!(!narrow.contains("左边日历"), "窄屏没有「左边」：{narrow}");
+
+    // 同一份控制器、同一屏，只换外壳：提示指回左边那一列
+    // （egui 在 `screen_rect` 为 `None` 时沿用上一帧的矩形，所以这里得明写宽屏尺寸）
+    let wide = texts(&run_output(
+        &ctx,
+        &mut app,
+        frame(0.8).screen(1200.0, 800.0),
+    ));
+    assert!(
+        wide.contains("点左边日历上的任何一天"),
+        "宽屏的日历在正文左边：{wide}"
+    );
+    assert!(!wide.contains("点底栏"), "宽屏没有底栏浮层：{wide}");
+}
+
 /// 返回键：浮层 → 搜索 → 退出，一次一层；退到底才交给退出钩子
 #[test]
 fn the_back_key_unwinds_one_layer_at_a_time() {
@@ -1697,12 +1739,14 @@ fn going_to_the_background_writes_the_pending_edits() {
     assert!(!eframe::App::persist_egui_memory(&app));
 }
 
-/// 输入法上屏的字（Android 的 JNI 桥推进队列）要变成这一帧的文本事件。
+/// 输入法上屏的字要变成这一帧的文本事件，落进当前那一行并落盘。
 ///
-/// 这一条盯的是手写不出来的那条路：软键盘的字在手机上根本不走键盘事件，
-/// 全靠 `push_text` → `raw_input_hook` → `Event::Text` 这一段。
+/// 这一条盯的是手写不出来的那段接线：软键盘的字在手机上根本不走键盘事件，
+/// 全靠“快照差分（[`ToDay::ime`]）→ [`ToDay::app::App::apply_ime_snapshot`]
+/// → `Event::Text`”这一段。快照的来源（`AndroidApp`）是 Android 独有，
+/// 这里直接喂快照正文；Android 那三行读法只能装机验（见 `docs/android.md`）。
 #[test]
-fn text_pushed_by_the_ime_bridge_lands_in_the_focused_row() {
+fn ime_text_lands_in_the_focused_row() {
     let ctx = egui::Context::default();
     theme::install(&ctx);
     let (mut app, spy) = fake_app();
@@ -1713,20 +1757,19 @@ fn text_pushed_by_the_ime_bridge_lands_in_the_focused_row() {
     // 焦点先落在今天那一行（真实运行时是用户点一下）
     run(&ctx, &mut app, frame(0.5).focused_on(row));
 
-    // Java 侧刚推了一段中文进来，接着就是 eframe 的一帧：先 `raw_input_hook`，再画
-    ToDay::app::push_text("中文".to_owned());
+    // eframe 的一帧：先把快照差分进这一帧要注入的事件，再画
     let mut input = egui::RawInput {
         time: Some(0.6),
         focused: true,
         ..Default::default()
     };
-    eframe::App::raw_input_hook(&mut app, &ctx, &mut input);
+    app.apply_ime_snapshot(&mut input, "中文", None);
     assert!(
         input
             .events
             .iter()
             .any(|event| matches!(event, Event::Text(text) if text == "中文")),
-        "推给队列的字该变成这一帧的文本事件：{:?}",
+        "快照里新上屏的字该变成这一帧的文本事件：{:?}",
         input.events
     );
 
@@ -1736,7 +1779,7 @@ fn text_pushed_by_the_ime_bridge_lands_in_the_focused_row() {
     });
     output.textures_delta.clear();
 
-    // 防抖到点：这一句应该已经落进"库"里
+    // 防抖到点：这一句应该已经落进“库”里
     run(&ctx, &mut app, frame(1.1).focused_on(row));
     assert_eq!(
         spy.borrow().entries.get(&day).map(String::as_str),
@@ -1744,14 +1787,13 @@ fn text_pushed_by_the_ime_bridge_lands_in_the_focused_row() {
         "输入法上屏的字该写进库"
     );
 
-    // 输入法的退格也要走得通：它到底也是 `deleteSurroundingText`，不是键盘事件
-    ToDay::app::push_backspace(1);
+    // 输入法的退格也要走得通：快照短了一个字
     let mut input = egui::RawInput {
         time: Some(1.2),
         focused: true,
         ..Default::default()
     };
-    eframe::App::raw_input_hook(&mut app, &ctx, &mut input);
+    app.apply_ime_snapshot(&mut input, "中", None);
     assert!(
         input.events.iter().any(|event| matches!(
             event,
@@ -1761,7 +1803,7 @@ fn text_pushed_by_the_ime_bridge_lands_in_the_focused_row() {
                 ..
             }
         )),
-        "退格该变成按键事件：{:?}",
+        "快照短了的字该变成退格事件：{:?}",
         input.events
     );
     let mut output = ctx.run_ui(input, |ui| {

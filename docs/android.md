@@ -13,7 +13,7 @@
 | 编译与打包 | 本机验证过：`cargo ndk` + `gradlew assembleDebug` 出 `app-debug.apk`（16~29 MB；`lib/arm64-v8a/libToDay.so` 与两个 dex 都在包里，manifest 合并结果里的包名 / Activity / `lib_name` / `allowBackup=false` / `adjustResize` 都对了） |
 | 静态检查 | 本机验证过：桌面三道门禁 + `cargo ndk -t arm64-v8a clippy --lib -- -D warnings` 与 `cargo ndk doc` 都干净 |
 | 真机（vivo V2453A / OriginOS，Android 16） | 启动、渲染（Vulkan / Adreno 825）、中文字体、系统栏、软键盘弹出、`adjustResize`、返回键退出、无崩溃 —— 都验证过，见下方"真机上验过什么" |
-| 中文（拼音）输入 | 桥已做（见"中文输入"）：软键盘上屏的字现在走 Java 的 `InputConnection` → JNI → egui。Rust 那半有测试盯着，**真机上要用手指敲一遍才算数**（我盲点不到候选栏） |
+| 中文（拼音）输入 | 应用侧已接：每帧读一次 game-activity 的文本快照，差分后注入 `egui`（见"中文输入"）。差分逻辑在 `src/ime.rs`（有单测），读快照那三行只能装机验——**真机上要用手指敲一遍才算数** |
 
 ## 真机上验过什么
 
@@ -23,11 +23,34 @@
 | --- | --- |
 | 启动与渲染 | ✓ `egui_wgpu` 选到 Vulkan / Adreno 825（备选 GLES 3.2），首帧不闪白底 |
 | 中文字体 | ✓ 无方块：`/system/fonts/NotoSansCJK-Regular.ttc`（无衬线）与 `NotoSerifCJK-Regular.ttc`（衬线）都在，两条候选路径都补上了 |
-| 系统栏 | ✓ 内容没有被状态栏与手势条压住（`values-v35` 那句退出强制 edge-to-edge 生效了） |
-| 软键盘 | ✓ 点输入框就弹（`mInputShown=true`），窗口跟着键盘缩（`adjustResize` + `windowSoftInputMode`），卡片没被挡住 |
-| 键盘的字能不能进应用 | ✗ **进不来**：软键盘的字走 `InputConnection.commitText` → game-activity 的 `TextEvent`，而 winit 0.30.13 不消费它（注入的 `KeyEvent` 也不行：winit 对没有 `KeyCharacterMap` 的虚拟设备反查不出字符）。这是本轮最大的发现，修法见"中文输入" |
-| 返回键退出 | ✓ 干净退出，崩溃缓冲区 0 条；Activity 结束、前台回桌面；重开时同一个进程里重新起 `android_main`（数据还在） |
-| 崩溃 | ✓ `adb logcat -b crash` 全程 0 条（修之前 `std::process::exit` 那条路是 `SIGABRT`） |
+| 系统栏 | ✓ 内容从状态栏下沿起画（顶栏完整、「锁定」可点），底栏在手势条之上。**但走的是运行时那条路**：主题里的 `windowOptOutEdgeToEdgeEnforcement` 在这台 Android 16 上没生效，见「已知取舍」的“系统栏走运行时 API”一条 |
+| 软键盘 | ✓ 点输入框就弹（`mInputShown=true`），窗口跟着键盘缩（`adjustResize` + `windowSoftInputMode`）。**但这台机器上偶发弹不出来**：最后一次 show 是 `STATUS_SUCCESS`，紧接着 `system_server` 发了一次 hide（`mViewVisibility=GONE`）；同一时刻系统“设置”的搜索框能弹，所以不是设备级的。判据看 `dumpsys input_method` 的 `ImeTracker` 与 `mSoftInputShowHideHistory`，详见"中文输入"的“编辑器信息”一节 |
+| 指尖点按与注入点按 | ✓ 两者都能把光标落进密码框（`adb shell input tap 630 1187` 之后密码框出现文本光标）。之前“手指点按整个不工作”的根因是应用自己崩了，不是触摸链路，见下方“点按曾整个不工作” |
+| 键盘的字能不能进应用 | 应用侧已经接上了（见"中文输入"）：字从 `AndroidApp` 的文本快照读出来、差分后注进 `egui`。注入的 `KeyEvent` 仍然不行：`adb shell input text abc123` 一个字都没进（winit 的角色反查靠设备的 `KeyCharacterMap`，注入的虚拟设备查不到） |
+| 返回键退出 | ✓ 干净退出，崩溃缓冲区 0 条；Activity 正常结束、前台回桌面；重开时同一个进程里重新起 `android_main`（数据还在） |
+| 崩溃 | ✓ `adb logcat -b crash` 全程 0 条 |
+
+### 点按曾整个不工作
+
+结论：那是**应用在输入法连上的一瞬间自己崩了**，不是触摸事件进不来。
+
+根因：装了原来的 `ToDayActivity` 之后，它重写的 `onCreateInputConnection` 会在新建的连接上调
+`InputConnection.setSoftKeyboardActive`，而 AGDK 4.4.0 那个方法末尾无条件 `restartInput()`，
+于是回到 `onCreateInputConnection` 再来一遍——Java UI 线程栈溢出。
+
+判据（装机就能看）：
+
+```
+adb logcat -b crash | head -1
+  java.lang.StackOverflowError: stack size 8188KB
+  at com.today.diary.ToDayActivity$ImeSurfaceView.onCreateInputConnection(ToDayActivity.java:63)
+  at com.today.diary.ToDayActivity$ImeSurfaceView.onCreateInputConnection(ToDayActivity.java:38)   ← 这两行反复出现
+```
+
+现象上是：界面画完最后几帧（所以截图看着完全正常），Java 线程卡在递归里，
+触摸回调（`OnTouchListener`）也在那条线程上，随后进程被杀回桌面。
+现在 `AndroidManifest.xml` 里直接就是 `com.google.androidgamesdk.GameActivity`，
+没有 Java 子类，也没有 JNI 入口。
 
 ## 工具链
 
@@ -162,47 +185,91 @@ android-activity 的文档也明确说别这么干；它给的替代路就是"�
 代价：关窗后进程会留在后台（Android 正常行为），重开时在同一个进程里重新起 `android_main`——
 真机上验过，重开正常、数据还在。
 
-## 中文输入（JNI 桥）
+## 中文输入
 
-真机上量到的链路：软键盘（搜狗）敲字 → 输入法弹候选 → 选中 → 输入法调 `InputConnection.commitText`
-→ game-activity 的 `GameTextInput` → `TextEvent` → **winit 0.30.13 不消费**（源码里 `InputEvent` 的 match
-只认 `MotionEvent` / `KeyEvent`，其余只打一条 warn）→ 应用一个字也收不到。
-注入的 `KeyEvent` 也不行：winit 的角色反查靠设备的 `KeyCharacterMap`，虚拟设备（`input keyevent`）查不到。
+真机上量到的链路：软键盘敲字 → 输入法弹候选 → 选中 → 输入法调 `InputConnection.commitText`
+（退格走 `deleteSurroundingText`）→ game-activity 的 `GameTextInput` 内部状态 → `android_app.textInputState = 1`
+→ winit 的 `InputEvent::TextEvent`。**winit 0.30.13 的 Android 后端不消费它**（`InputEvent` 的 match 只认
+`MotionEvent` / `KeyEvent`，其余打一条 warn 就算完），所以字必须由应用自己接。
 
-所以字必须从 Java 侧接：
+接法分四段，代码分别在 `src/app.rs`（每帧的时机）、`src/android.rs`（读快照）、`src/ime.rs`（差分）。
 
-1. `android/app/src/main/java/com/today/diary/ToDayActivity.java`
-   —— 继承 `GameActivity`，在 `createSurfaceView()` 里换成自己的 SurfaceView，交出去一份
-   `gametextinput.InputConnection` 的子类：`commitText` 与 `deleteSurroundingText`
-   各推一次 native（`nativePushText` / `nativePushBackspace`），两份都照旧调 `super`
-   （GameActivity 自己那份状态要跟输入法保持一致）。
-   AGDK 的语义要注意：软键盘没被请求显示时 `onCreateInputConnection` **就返回 null**，
-   窗口刚拿到焦点时输入法先来问一次——照旧返回 null，别自作聪明。
-2. `src/android.rs` —— 两个 `#[unsafe(no_mangle)] extern "system"` 入口，只做加锁入队
-   （可能在 Java 的 UI 线程被调，绝不在那里碰 egui）。
-3. `src/app.rs` —— `push_text` / `push_backspace` 入队，[`App::raw_input_hook`](crate::app::App::raw_input_hook)
-   每帧取走并注入 `egui::Event::Text` / `egui::Event::Key { Backspace }`（eframe 官方给输入注入留的口子）。
-   退格也造按键事件，是因为输入法退格走的也是 `deleteSurroundingText`，不是键盘事件。
+### 1. 读快照：不是 `AndroidApp::text_input_state()`
 
-不做 pre-edit（组词下划线）：组词期间的字不进正文，上屏时才进——日记只要"字进得来"。
+`android-activity` 0.6.1 那个读法在**输入法还没推过任何东西**时会崩：它的回调对零初始化的状态
+做 `slice::from_raw_parts(空指针, 0)`，debug 构建里的 UB 检查直接 `abort`。真机栈：
 
-直觉上应该能行的地方：点中输入框时 egui 通过 `set_ime_allowed(true)` → winit 的
-`show_soft_input(true)` 把软键盘弹出来，键盘上的字母键走 `KeyEvent` → `KeyCharacterMap` → ASCII 能进。
+```
+core::slice::raw::from_raw_parts::precondition_check
+  (inlined by) <AndroidAppInner>::map_input_state_to_text_event_callback  ← android-activity/src/game_activity/mod.rs:717
+GameTextInput_getState                       ← AGDK 的 C 函数
+  (inlined by) GameActivityGlue>::text_input_state
+  (inlined by) <ToDay::app::App>::inject_ime_events
+```
 
-拼音这条路不走 `KeyEvent`：输入法把按键自己吃掉，组好词之后通过 `InputConnection.commitText`
-上屏，那在 game-activity 里是 `InputEvent::TextEvent`，而 winit 0.30.13 的 Android 后端不处理它
-（`InputEvent` 的 match 只有 `MotionEvent` 与 `KeyEvent`，其余打一条 warn 就算完）。
-**所以拼音候选上屏很可能收不到。**
+而 crates.io 上 `android-activity` 最新就是 0.6.1，没有修复可用。所以 `src/android.rs` 自己调 AGDK
+的同一个 C 接口（`GameActivity_getTextInputState`，符号来自 `android-activity` 链进 `libToDay.so`
+的那份 glue），回调里先看 `text_utf8` 空不空。native handle 由公开的
+`GameActivity.getGameActivityNativeHandle()` 经一次 JNI 读回（`AndroidApp::vm_as_ptr()` /
+`activity_as_ptr()` 都是公开口子，**不往 Java 侧放任何东西**）。
 
-真机结论决定下一步：
+两个单位要当心：
 
-| 真机现象 | 结论 |
+* 正文是 **modified UTF-8**（Java 的 `GetStringUTFChars` 格式），用 `simd_cesu8` 解。
+* `selection` / `composingRegion` 是 **Java 的 UTF-16 码元下标**——AGDK 直接把 Java 的 `State`
+  搬了过来，而正文长度却是 UTF-8 字节数。`src/android.rs` 里换成字节下标再交给差分。
+
+### 2. 差分：`src/ime.rs`
+
+每帧拿到的不是“这一次敲了什么”，而是输入法眼里的**整段正文**（含组词区）。所以比上一次：
+
+| 快照的变化 | 产出的注入 |
 | --- | --- |
-| 拼音能上屏 | 什么都不用做（那就说明设备上走的是别的路径） |
-| 拼音上屏丢字 / 候选不上屏 | 做 JNI 桥：Gradle 侧给 Activity 挂一个 0 尺寸 `EditText`（或子类化 GameActivity 覆盖 `onCreateInputConnection`），把 `commitText` 经 JNI 推给 Rust；Rust 侧在 `App::raw_input_hook`（eframe 官方给输入注入留的口子）里 drain 成 `egui::Event::Text` 塞进 `raw_input.events` |
-| 连软键盘都不弹 | 先查 `set_ime_allowed`，再查窗口是不是被 `windowOptOutEdgeToEdgeEnforcement` 之外的东西挡住了 |
+| 正文是上一次的延长（多出几个字） | `Event::Text(多出来的那段)` |
+| 正文短了 | 每个少掉的字符一个 `Key::Backspace` |
+| 既不是延长也不是截断（改到中间、整段替换） | 先退到公共前缀，再把剩下的补上 |
+| 只有组词区在变（拼音打在候选里） | 什么都不产出——组词区不算上屏 |
 
-不做 pre-edit 下划线与选区同步：日记只要"字进得来"。
+这一层不认识 `egui`、不碰磁盘、也不依赖 Android API，所以逐字追加 / 输入法退格 / 拼音组词区 /
+中间插入 / 越界或切在字符中间的组词区都有单测（`cargo test ime`）。
+
+一条去重规矩在 `App::apply_ime_snapshot`：**这一帧已经收到键盘的退格时不再补退格**——
+输入法删字可能既走 `sendKeyEvent`（→ winit → `Event::Key { Backspace }`）又改快照，两边都注入就一按删两个字。
+
+### 3. 编辑器信息（`inputType`）：不给就叫不出键盘
+
+不给的话 `inputType` 是 0（`TYPE_NULL`），输入法只能摆一个数字/符号键盘（真机上就是这样）。
+现在按当前屏给（`App::sync_ime_editor_info`）：
+
+| 屏 | `inputType` |
+| --- | --- |
+| 设密码 / 解锁（主密码） | `TYPE_CLASS_TEXT \| TYPE_TEXT_FLAG_NO_SUGGESTIONS` |
+| 搜索框（浮层开着） | `TYPE_CLASS_TEXT` |
+| 正文 | `TYPE_CLASS_TEXT \| TYPE_TEXT_FLAG_MULTI_LINE`（拼音候选要留着） |
+
+`imeOptions` 一律带 `IME_FLAG_NO_FULLSCREEN`：不给时输入法会去走“全屏提取”模式，
+真机上量到的表现是 IME 窗口请求整屏高度、键盘一个像素都画不出来。
+
+**不要用 `TYPE_TEXT_VARIATION_PASSWORD`**：vivo 会把带密码变体的编辑器路由给自家的安全输入法，
+而这套在这台机器上每次都失败：
+
+```
+adb shell dumpsys input_method | grep TYPE_SHOW
+type=TYPE_SHOW - STATUS_FAIL - com.vivo.secime.service:...        ← 请求者已经不是应用了
+```
+
+`NO_SUGGESTIONS` 不是密码变体，不会触发这条路由，它挡的是“输入法把主密码学进自己的词库”。
+
+### 4. 叫醒：输入法上屏不给应用发事件
+
+输入法上屏只在 game-activity 内部改状态，**不会给 winit 送任何事件**；不自己排帧的话，
+一段上屏的字要等到下一次别的输入才画出来。所以有输入框在焦点上时（`ctx.text_edit_focused()`），
+每 200 毫秒排一帧（`App::IME_POLL_MILLIS`）。代价见“已知取舍”。
+
+### 还没验的
+
+真机上要用手指过一遍（我拄不到候选栅）：拼音候选上屏进正文、输入法退格删对一个字、
+组词期间拼音不出现在正文里。单测盯的是差分本身，盯不到“快照里到底有没有字”。
 
 ## 窄屏外壳
 
@@ -216,6 +283,12 @@ android-activity 的文档也明确说别这么干；它给的替代路就是"�
   后面没有了就不画这枚按钮（摆一枚按不动的按钮只会让人以为坏了）。
 - 侧栏（搜索框 + 日历 + 页脚）在窄屏排进 `egui::Modal` 浮层：同一批 widget、同一个顺序，
   只有容器不同。点某天 / 点浮层外面 / 按返回键 / 打开一条搜索结果都收起。
+- 正文面板拿到的是外壳交下来的 `shell::Chrome`（空页提示指哪儿、撤销条离窗口底边多高、
+  放不放正文摘要），它自己仍然看不到断点与宽度：
+  - 空页提示：窄屏是“点底栏「日历」挑一天，就可以开始写”，宽屏仍是“点左边日历上的任何一天”。
+  - 撤销条浮在当前那条底栏之上（宽屏 30 + 12pt，窄屏 58 + 12pt），不再按屏幕底写死 42pt。
+  - 撤销条窄屏不放正文摘要（400pt 的屏上排不下，见“已知取舍”）。
+  - 行列表末尾留 18pt 空隙，最后一行不贴着下面的面板。
 - 正文左右留白来自 `theme::column` 的 26pt 下限，窄屏不用另加一档。
 - 触摸目标：`Piece::button` 的上下内边距在 Android 上撑到 44pt（顶栏/底栏/浮层里的按钮都走它），
   `style.spacing.button_padding` 也调到同一个量级（长按正文弹出的"删除这一天"跟着变大）。
@@ -226,17 +299,25 @@ android-activity 的文档也明确说别这么干；它给的替代路就是"�
 
 ## 真机验收清单
 
-装机之后按这个顺序过一遍（每条都要有结论，结论回填到本节）：
+装机之后按这个顺序过一遍（每条都要有结论，结论回填到本节）。
+注：带“注入”的几条是用 `adb shell input tap` 验的（触摸事件本身与指尖同一条路）；
+**指尖那一轮还没跑**，没勾的都待人验。
 
-- [x] 首次启动 → 设主密码（≥8 字符）→ 进主界面，不闪白底（`adb logcat -s ToDay` 看得到启动日志）
-- [x] 中文不显示方块（vivo 上有 `NotoSansCJK` 与 `NotoSerifCJK`）
-- [x] 顶栏与底栏没有被状态栏 / 手势条压住（内容能点得到）
-- [x] 点正文 → 软键盘弹出
-- [ ] **打中文（拼音）：候选上屏进不进得来** ← JNI 桥做好后待人验（Rust 侧有测试盯着）
+- [x] 启动与渲染：不闪白底、`logcat -b crash` 0 条（自动验过）
+- [x] 中文不显示方块（vivo 上有 `NotoSansCJK` 与 `NotoSerifCJK`；截图里「先设一个主密码」就是衬线中文）
+- [x] 顶栏与底栏没有被状态栏 / 手势条压住（真机量过：状态栏 133px，顶栏 58pt=203px 从 y=133 起画；
+      点「锁定」能生效、点密码框能叫起输入法、键盘弹出后卡片跟着上移）
+- [x] 点输入框有反应：注入点按落在密码框上 → 字段获得焦点、出现文本光标（注入验的）
+- [ ] **指尖**：点密码框 → 键盘弹出 → 键入并看到掩码（键盘能不能弹有偶发问题，见“中文输入”的“编辑器信息”：
+      真机上量到过两种：点密码框时 `ImeTracker` 里有 SHOW、随即被系统收掉；点「锁定」回解锁页那次 QWERTY 正常弹出，
+      卡片跟着上移（`adjustResize` 还在））
+- [ ] **打中文（拼音）：候选上屏进不进得来** ← 应用侧已重做，待人验
 - [ ] 打字 → 立刻按 Home 切后台 → 再回来：字没丢，光标与滚动位置还在
 - [ ] 杀进程（最近任务里划掉）→ 重开 → 数据还在
-- [ ] 点"锁定" → 回解锁界面；再解锁回来，正文重新出现
-- [ ] 长按正文 → 弹出"删除这一天" → 删除 → 底部撤销条出现 → 点"撤销"能回来
+- [ ] 点“锁定” → 回解锁界面；再解锁回来，正文重新出现
+- [x] 空月（翻到没记录的一个月）：提示指底栏「日历」，不写“左边日历”
+- [x] 滚到列表最后一行：下面还留一点空隙，不贴着底栏
+- [x] 长按正文 → 弹出“删除这一天” → 删除 → 底部撤销条出现（浮在底栏之上、整条在屏内） → 点“撤销”能回来
 - [ ] 底栏「搜索」→ 浮层弹出、焦点在搜索框、键盘弹出 → 输入 → 命中列出 → 点一条：浮层收起、
       跳到那天、命中那句被选中
 - [ ] 底栏「日历」→ 浮层弹出（键盘不弹）→ 点某天：浮层收起、正文切到那天
@@ -250,10 +331,22 @@ android-activity 的文档也明确说别这么干；它给的替代路就是"�
 ## 已知取舍
 
 - **强杀丢最后 0.4 秒**：与桌面同一条。切后台、返回键退出、eframe 自动保存都会落盘。
+- **打字期间每秒多画几帧**：输入法上屏不给应用发 winit 事件（见"中文输入"），只能自己排帧；
+  有输入框在焦点上时每 200 毫秒一帧，没焦点时一帧都不多排。
+- **输入法快照是“全量比对”，不是“收到一次回调”**：比的是上一次的正文，所以输入法把光标
+  移到别处（正文没变）不会产出任何动作；代价是“改到中间”只能退到公共前缀再重打（多几次退格）。
+- **退格去重会丢一次“双重退格”**：同一帧里键盘退格与快照变短同时出现时只算一次；
+  一次按键删两个字的输入法在这条路上会少删一个（比“一下删两个字”安全）。
+- **快照的读法是绕上游 bug 的**：`android-activity` 0.6.1 的 `text_input_state()` 在输入法还没
+  推过东西时会 `abort`（判据见"中文输入"），所以自己调 AGDK 的 C 接口。上游出新版、
+  且修了这条之后，那一段可以换回公开 API。
+- **vivo 上键盘偶发弹不出来**：`ImeTracker` 里能看到我们的 show 成功、随后 `system_server` 又发 hide。
+  同一时刻系统“设置”的搜索框能弹，所以不是设备级；换输入法（搜狗 ↔ 百度）也一样。
+  真机上遇到“键盘没弹”时先点一下别的输入框再回来，或重启应用。
+- **主密码框在输入法眼里不是“安全字段”**：`TYPE_TEXT_VARIATION_PASSWORD` 会被 vivo 路由给
+  自家安全输入法（那套在这台机器上弹不出来），所以用 `NO_SUGGESTIONS` 挡学词代替。
+- **不做 pre-edit（组词下划线）与选区同步**：组词期间的字不进正文，上屏时才进——日记只要“字进得来”。
 - **手机与桌面是两个独立的库**：没有导出、没有同步；卸载 = 日记没了。
-- **系统栏**：`targetSdk 35` 会被强制 edge-to-edge，而 winit 0.30 不把 insets 转给应用，
-  所以 `values-v35/themes.xml` 里关掉了这条强制（`android:windowOptOutEdgeToEdgeEnforcement`）。
-  想让内容画满屏幕就得先在 Rust 侧拿到安全区，那是另一轮的事。
 - **字体不打包**：用系统那一份（省 10~16 MB）。系统里没有 CJK 字体时中文是方块或 `?`，
   日志里会有一条 warn（`未找到中文字体文件`）。
   真机上踩过一个反面例子：**衬线（`display`）那条候选链只写了桌面路径**，
@@ -263,6 +356,18 @@ android-activity 的文档也明确说别这么干；它给的替代路就是"�
 - **输入法的回车/换行行为没单独验**：候选上屏与退格都接了，但输入法那颗回车键是走
   `sendKeyEvent` 还是 `performEditorAction` 没在真机上看过——输密码靠「开始写」按钮，
   正文里换行还没人试过。
+- **窄屏的撤销条不放正文摘要**：`已删掉 9 月 18 日的日记` 一行放得下；
+  带上 12 字摘要那句在 400pt 的屏上量到 444pt 宽，整条会超出屏幕（右端的「撤销」点不到），
+  所以窄屏只报日期。宽屏仍带摘要。
+- **系统栏走运行时 API，不走主题那条 opt-out**：`targetSdk 35` 在 Android 15+ 被强制 edge-to-edge。
+  `values-v35/themes.xml` 里那条 `android:windowOptOutEdgeToEdgeEnforcement` 编进包里了
+  （`aapt2 dump resources` 看得到 `0x0101069a=true`），但这台 Android 16 / OriginOS 上没生效：
+  窗口帧量到的是 `[0,0][1260,2800]`，58pt 顶栏从屏幕 y=0 画，被 38pt 的状态栏盖住
+  （「锁定」点不到、保存状态字看不见）。现在改在 `android.rs` 启动时 JNI 调
+  `Window.setDecorFitsSystemWindows(true)`（API 30+）：窗口帧仍然全屏，但 `DecorView` 把内容视图
+  内缩了——surface 从 y=133 起，顶栏完整、点按仍对齐、键盘照旧 `adjustResize`。
+  主题里那条留着无害（换系统版本说不定又认它了）；真想自己画到系统栏底下（底色延伸、内容让位），
+  得先在 Rust 侧拿到 insets（`GameActivity_getWindowInsets` 是现成的 C 接口），那是另一轮的事。
 - **触摸目标**：按钮 ≥44pt，但日历格子（42pt 高）与搜索框（34pt 高）比 44 小一点：
   它们按视觉密度定的高，单独抬会让日历一屏放不下。
 - **后台不自动锁定**：与桌面一致（锁定是用户动作）。最近任务里的截图可能露出正文，

@@ -27,6 +27,12 @@ pub const MOBILE_MARGIN_X: f32 = 24.0;
 /// 窄屏浮层的宽度上下限：小于日历排不下，大于手幅就不好按了
 pub const MOBILE_SHEET_MIN_WIDTH: f32 = 280.0;
 pub const MOBILE_SHEET_MAX_WIDTH: f32 = 420.0;
+/// 撤销条离下面那条面板留的一道缝
+const TOAST_GAP: f32 = 12.0;
+/// 宽屏的空页提示：日历就在正文左边那一列
+const EMPTY_HINT_WIDE: &str = "点左边日历上的任何一天，就可以开始写";
+/// 窄屏的空页提示：日历收在底栏「日历」那枚按钮开的浮层里
+const EMPTY_HINT_NARROW: &str = "点底栏「日历」挑一天，就可以开始写";
 const ERROR_BAR_HEIGHT: f32 = 34.0;
 /// 面板左右内边距
 const PANEL_PADDING_X: i8 = 22;
@@ -45,6 +51,41 @@ pub fn error_bar_height() -> f32 {
 /// 面板的水平内边距
 pub fn panel_padding_x() -> i8 {
     PANEL_PADDING_X
+}
+
+/// 外壳交给面板的几个数：这块面板下面要让开多少、空页提示指哪儿、放不下什么。
+///
+/// 面板不认识"窄屏/宽屏"（见 `docs/architecture.md` 的"为什么窄屏只换外壳"），
+/// 断点由 `App::diary_screen` 判、结果经 [`Chrome::of`] 传进来。
+/// 宽屏那一组取值与外壳写死它们时逐值相同，桌面行为不变。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Chrome {
+    /// 空页那行提示：两种布局里"日历"不在同一个地方
+    pub empty_hint: &'static str,
+    /// 撤销条离窗口底边多高（让开下面那条面板 + 一道缝）
+    pub bottom_inset: f32,
+    /// 撤销条里放不放正文摘要（360pt 的屏上放不下）
+    pub undo_preview: bool,
+}
+
+impl Chrome {
+    /// 按外壳是否窄屏给出一组取值。`narrow` 由 `App::diary_screen` 算好
+    /// （`available_width < MOBILE_BREAKPOINT`），面板自己不看宽度。
+    pub fn of(narrow: bool) -> Self {
+        if narrow {
+            Self {
+                empty_hint: EMPTY_HINT_NARROW,
+                bottom_inset: MOBILE_STATUS_BAR_HEIGHT + TOAST_GAP,
+                undo_preview: false,
+            }
+        } else {
+            Self {
+                empty_hint: EMPTY_HINT_WIDE,
+                bottom_inset: STATUS_BAR_HEIGHT + TOAST_GAP,
+                undo_preview: true,
+            }
+        }
+    }
 }
 
 /// 用户点了底栏上哪个按钮：两个按钮开的是同一张浮层，区别只在焦点放在哪

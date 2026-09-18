@@ -11,7 +11,7 @@
 
 use crate::model::{Change, MonthSheet};
 use crate::ui::calendar::weekday_name;
-use crate::ui::theme;
+use crate::ui::{shell, theme};
 use chrono::{Datelike, Local, NaiveDate, Weekday};
 use egui::{
     self, Align2, CornerRadius, Layout, Margin, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2,
@@ -35,6 +35,8 @@ const DAY_WEEKDAY_GAP: f32 = 5.0;
 const BODY_SIZE: f32 = 15.5;
 /// 撤销条显示多久（秒）
 const UNDO_SECONDS: f64 = 8.0;
+/// 行列表末尾留的空隙：最后一行不贴着下面那条面板
+const LIST_TAIL: f32 = 18.0;
 
 /// 日记面板这一帧交出来的东西：只有意图，没有副作用
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -126,8 +128,17 @@ impl Diary {
         Self::default()
     }
 
-    /// 展示这一页，返回这一帧的意图
-    pub fn show(&mut self, ui: &mut Ui, sheet: &MonthSheet, selected: NaiveDate) -> DiaryEvent {
+    /// 展示这一页，返回这一帧的意图。
+    ///
+    /// `chrome` 是外壳交下来的布局取值（[`shell::Chrome`]）：面板自己不看宽度，
+    /// 窄屏与宽屏的区别全在这几个数里。
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        sheet: &MonthSheet,
+        selected: NaiveDate,
+        chrome: shell::Chrome,
+    ) -> DiaryEvent {
         let key = sheet.key();
         let today = Local::now().date_naive();
         let now = ui.input(|i| i.time);
@@ -164,7 +175,7 @@ impl Diary {
             theme::empty_hint(
                 ui,
                 &format!("{} 年 {} 月还没有记录", key.year(), key.month()),
-                "点左边日历上的任何一天，就可以开始写",
+                chrome.empty_hint,
             );
         }
 
@@ -227,9 +238,11 @@ impl Diary {
                         event.blurred = true;
                     }
                 }
+
+                ui.add_space(LIST_TAIL);
             });
 
-        self.undo_toast(ui, now, &mut event);
+        self.undo_toast(ui, now, chrome, &mut event);
         event
     }
 
@@ -291,8 +304,11 @@ impl Diary {
         );
     }
 
-    /// 撤销条：贴底浮着，到点自己消失
-    fn undo_toast(&mut self, ui: &mut Ui, now: f64, event: &mut DiaryEvent) {
+    /// 撤销条：贴底浮着，到点自己消失。
+    ///
+    /// 离底边多高、放不放摘要都由 [`shell::Chrome`] 说了算：窄屏下面那条底栏更高，
+    /// 按屏幕底写死的偏移会把它压在底栏底下；窄屏上那句摘要也放不下。
+    fn undo_toast(&mut self, ui: &mut Ui, now: f64, chrome: shell::Chrome, event: &mut DiaryEvent) {
         let Some((date, preview, remaining)) = self.trash.as_ref().map(|trash| {
             (
                 trash.date,
@@ -307,6 +323,11 @@ impl Diary {
             self.trash = None;
             return;
         }
+        let wording = if chrome.undo_preview {
+            format!("已删掉 {date} 的日记「{preview}」")
+        } else {
+            format!("已删掉 {} 月 {} 日的日记", date.month(), date.day())
+        };
 
         // 倒计时要走字，动画要顺，所以按帧请求重绘
         ui.ctx()
@@ -320,7 +341,7 @@ impl Diary {
         egui::Area::new(egui::Id::new("undo_toast"))
             .anchor(
                 Align2::CENTER_BOTTOM,
-                Vec2::new(0.0, -42.0 + (1.0 - slide) * 12.0),
+                Vec2::new(0.0, -chrome.bottom_inset + (1.0 - slide) * 12.0),
             )
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
@@ -335,7 +356,7 @@ impl Diary {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(format!("已删掉 {date} 的日记「{preview}」"))
+                                RichText::new(&wording)
                                     .font(theme::sans(12.5))
                                     .color(theme::YELLOW_FG),
                             );
@@ -599,7 +620,7 @@ mod tests {
         let mut event = None;
         run_frame(&ctx, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                event = Some(diary.show(ui, &sheet, date(17)));
+                event = Some(diary.show(ui, &sheet, date(17), shell::Chrome::of(false)));
             });
         });
         assert_eq!(event, Some(DiaryEvent::default()), "没人操作时不该产出意图");
@@ -617,6 +638,7 @@ mod tests {
                     ui,
                     &MonthSheet::empty(key),
                     NaiveDate::from_ymd_opt(1999, 1, 5).unwrap(),
+                    shell::Chrome::of(false),
                 );
             });
         });
@@ -681,7 +703,7 @@ mod tests {
 
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                diary.show(ui, &sheet, date(17));
+                diary.show(ui, &sheet, date(17), shell::Chrome::of(false));
             });
         });
         output.textures_delta.clear();
@@ -727,7 +749,9 @@ mod tests {
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 // 宽度得自己限：测试里没有真实屏幕，根 UI 拿到的是 10000px
-                theme::column(ui, 320.0, |ui| diary.show(ui, &sheet, date(17)));
+                theme::column(ui, 320.0, |ui| {
+                    diary.show(ui, &sheet, date(17), shell::Chrome::of(false))
+                });
             });
         });
         output.textures_delta.clear();
@@ -771,7 +795,7 @@ mod tests {
         let mut event = None;
         ctrl_enter_frame(&ctx, row_id(date(17)), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                event = Some(diary.show(ui, &sheet, date(17)));
+                event = Some(diary.show(ui, &sheet, date(17), shell::Chrome::of(false)));
             });
         });
         assert_eq!(
@@ -788,7 +812,7 @@ mod tests {
         // 18 号是列表里的最后一行（19 号没写过）：焦点留在原地
         ctrl_enter_frame(&ctx, row_id(date(18)), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                diary.show(ui, &sheet, date(17));
+                diary.show(ui, &sheet, date(17), shell::Chrome::of(false));
             });
         });
         assert_eq!(
@@ -814,7 +838,7 @@ mod tests {
         // 选中 18 号：它没写过，但选中那天总会列出来，于是空行也在列表里
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                diary.show(ui, &sheet, date(18));
+                diary.show(ui, &sheet, date(18), shell::Chrome::of(false));
             });
         });
         output.textures_delta.clear();
@@ -870,7 +894,7 @@ mod tests {
 
         run_frame(&ctx, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                diary.show(ui, &sheet, date(17));
+                diary.show(ui, &sheet, date(17), shell::Chrome::of(false));
             });
         });
         let state = || egui::widgets::text_edit::TextEditState::load(&ctx, row_id(date(17)));
@@ -895,9 +919,101 @@ mod tests {
 
         run_frame(&ctx, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                diary.show(ui, &MonthSheet::empty(key), date(17));
+                diary.show(
+                    ui,
+                    &MonthSheet::empty(key),
+                    date(17),
+                    shell::Chrome::of(false),
+                );
             });
         });
         assert!(diary.trash.is_none(), "过期之后不该还留着正文副本");
+    }
+
+    /// 在 400×800 的屏上跑几帧，把撤销条那块底与最后一帧画出来的字取回来。
+    ///
+    /// 撤销条是 `Area` + 屏幕底锚点：`Area` 的第一帧只量尺寸、什么都不画，位置也跟上一帧
+    /// 量到的尺寸走，而滑入动画要 0.22 秒，所以看的是最后一帧。
+    /// 那块底靠 `YELLOW_BG` 认（全应用只有撤销条用它）。
+    fn toast_frame(
+        ctx: &egui::Context,
+        diary: &mut Diary,
+        chrome: shell::Chrome,
+    ) -> (Rect, String) {
+        let key = MonthKey::new(2025, 9).unwrap();
+        let mut painted = None;
+        for step in 0..3 {
+            let input = egui::RawInput {
+                time: Some(0.1 + f64::from(step) * 0.3),
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(400.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    diary.show(ui, &MonthSheet::empty(key), date(18), chrome);
+                });
+            });
+            output.textures_delta.clear();
+            painted = Some(output);
+        }
+        let output = painted.expect("至少跑一帧");
+
+        let rect = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(shape) if shape.fill == theme::YELLOW_BG => Some(shape.rect),
+                _ => None,
+            })
+            .expect("撤销条该画出来");
+        let mut shown = String::new();
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                shown.push_str(text.galley.text());
+                shown.push('\n');
+            }
+        }
+        (rect, shown)
+    }
+
+    /// 窄屏上撤销条整条留在屏内、压在底栏之上，而且不放正文摘要。
+    ///
+    /// 底栏比宽屏那条高（[`shell::MOBILE_STATUS_BAR_HEIGHT`]），按屏幕底写死的偏移会把它
+    /// 压在底栏底下；而带上摘要那一行在 400pt 的屏上根本排不下。
+    #[test]
+    fn narrow_chrome_keeps_the_undo_toast_on_screen() {
+        let ctx = frame();
+        let mut diary = Diary::new();
+        diary.trash = Some(Trash {
+            date: date(18),
+            text: "一段很长很长很长很长的正文".to_owned(),
+            at: 0.1,
+        });
+
+        let (rect, shown) = toast_frame(&ctx, &mut diary, shell::Chrome::of(true));
+        assert!(
+            rect.width() <= 400.0 - 2.0 * shell::MOBILE_MARGIN_X,
+            "撤销条比屏幕还宽：{rect:?}"
+        );
+        assert!(
+            rect.bottom() <= 800.0 - shell::MOBILE_STATUS_BAR_HEIGHT,
+            "撤销条压到底栏上了：{rect:?}"
+        );
+        assert!(
+            shown.contains("已删掉 9 月 18 日的日记"),
+            "窄屏的文案：{shown}"
+        );
+        assert!(!shown.contains("的日记「"), "窄屏放不下正文摘要：{shown}");
+
+        // 宽屏：位置与文案与窄屏改动之前逐值相同（底栏 30 + 12 缝），摘要还在
+        let (rect, shown) = toast_frame(&ctx, &mut diary, shell::Chrome::of(false));
+        assert!(
+            (800.0 - rect.bottom() - 42.0).abs() < 0.01,
+            "宽屏的 42pt 偏移变了：{rect:?}"
+        );
+        assert!(shown.contains("的日记「"), "宽屏该留着摘要：{shown}");
     }
 }

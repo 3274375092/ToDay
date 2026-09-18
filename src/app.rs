@@ -10,6 +10,9 @@
 //!
 //! 搜索走 [`SearchScheduler`]：查询安静 0.25 秒才扫一次库，扫之前先把待写的编辑落盘。
 //!
+//! 输入法上屏的字（Android 独有）每帧读一次 game-activity 的快照，差分后注入 `egui`：
+//! 时机在 [`eframe::App::raw_input_hook`]，差分与边界在 [`crate::ime`]，读法在 `crate::android`。
+//!
 //! 密码只在这里出现一瞬（从视图取出来交给存储层），控制器自己不持有密钥。
 
 use crate::model::{Change, MonthKey, MonthSheet};
@@ -30,49 +33,6 @@ use std::time::Duration;
 
 /// 打字安静多久之后落盘
 pub const SAVE_DEBOUNCE_SECONDS: f64 = 0.4;
-
-/// 输入法上屏的动作：Android 那边 Java 的 `InputConnection` 经 JNI 推到这里。
-///
-/// 为什么需要它：winit 0.30.13 的 Android 后端不消费 game-activity 的 `TextEvent`，
-/// 而软键盘敲出来的字与退格只走那条路——不接这一手，手机上就一个字也输不进去
-/// （真机验证过，见 `docs/android.md`）。桌面没人往里放，这一层就是空转。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PendingInput {
-    /// 上屏的文字
-    Text(String),
-    /// 光标左边删掉几个字符（输入法的退格）
-    Backspace(usize),
-}
-
-static PENDING_INPUT: std::sync::Mutex<Vec<PendingInput>> = std::sync::Mutex::new(Vec::new());
-
-/// 推一段输入法上屏的文字。
-///
-/// 可能在任意线程被调（Android 上是 Java 的 UI / Binder 线程）：这里只入队，
-/// 不碰 `egui`、不碰任何一个 [`App`]。真正的注入在 [`App::raw_input_hook`] 里。
-/// 取走发生在下一帧开始之前，所以同一段输入只会用上一次。
-pub fn push_text(text: String) {
-    if let Ok(mut queue) = PENDING_INPUT.lock() {
-        queue.push(PendingInput::Text(text));
-    }
-}
-
-/// 推一次退格（输入法在光标左边删掉了 `count` 个字符）。
-pub fn push_backspace(count: usize) {
-    if count > 0
-        && let Ok(mut queue) = PENDING_INPUT.lock()
-    {
-        queue.push(PendingInput::Backspace(count));
-    }
-}
-
-/// 取走这一帧之前攒下的输入（[`App::raw_input_hook`] 调）。
-fn take_input() -> Vec<PendingInput> {
-    PENDING_INPUT
-        .lock()
-        .map(|mut queue| std::mem::take(&mut *queue))
-        .unwrap_or_default()
-}
 
 /// 查询安静多久之后真的去搜一次
 pub const SEARCH_DEBOUNCE_SECONDS: f64 = 0.25;
@@ -256,6 +216,20 @@ pub struct App {
     window_memory: Option<PathBuf>,
     /// 窄屏浮层（搜索框 + 日历）开着没有。宽屏侧栏一直都在，这个状态没意义
     overlay_open: bool,
+    /// 输入法快照的读入口；桌面是 `None`（`App::with_ime_source` 只在 Android 入口被调）
+    #[cfg(target_os = "android")]
+    ime_source: Option<winit::platform::android::activity::AndroidApp>,
+    /// AGDK 的 native handle：读输入法快照要用；`None` = 还没拿到
+    #[cfg(target_os = "android")]
+    ime_handle: Option<i64>,
+    /// 取 handle 试过几次了（到上限就不再试，见 [`App::ensure_ime_handle`]）
+    #[cfg(target_os = "android")]
+    ime_handle_tries: u32,
+    /// 已经告诉输入法的编辑器大类；`None` = 还没说过（见 [`App::sync_ime_editor_info`]）
+    #[cfg(target_os = "android")]
+    ime_kind: Option<ImeKind>,
+    /// 上一次快照里“已经上屏”的正文（组词区不算），下一次差分拿它当基准
+    ime_committed: String,
 }
 
 impl App {
@@ -288,6 +262,15 @@ impl App {
             error: None,
             window_memory: None,
             overlay_open: false,
+            #[cfg(target_os = "android")]
+            ime_source: None,
+            #[cfg(target_os = "android")]
+            ime_handle: None,
+            #[cfg(target_os = "android")]
+            ime_handle_tries: 0,
+            #[cfg(target_os = "android")]
+            ime_kind: None,
+            ime_committed: String::new(),
         })
     }
 
@@ -297,6 +280,72 @@ impl App {
     pub fn with_window_memory(mut self, path: PathBuf) -> Self {
         self.window_memory = Some(path);
         self
+    }
+
+    /// 接上输入法快照的来源（只有 Android 入口会调，见 `src/android.rs`）。
+    ///
+    /// 接了之后 [`eframe::App::raw_input_hook`] 每帧读一次输入法快照，把差量注入成
+    /// 这一帧的 `egui` 事件。不接（桌面、测试）时那条路根本不存在，行为与以前一字不差。
+    ///
+    /// native handle 不在这里取：`initializeNativeCode` 先起 `android_main` 再写 Java 的
+    /// `nativeHandle`，这一步问到的可能就是 0。头几帧由 `App::ensure_ime_handle` 补上。
+    #[cfg(target_os = "android")]
+    pub fn with_ime_source(mut self, app: winit::platform::android::activity::AndroidApp) -> Self {
+        self.ime_source = Some(app);
+        self
+    }
+
+    /// 把一份输入法快照差分进这一帧要注入的事件里。
+    ///
+    /// `text` 是输入法眼里的完整正文（含组词区），`compose` 是组词区的字节下标；
+    /// 差分规则与边界在 [`crate::ime::injections`]。返回值不回传：基准更新在 `ime_committed`。
+    ///
+    /// 调用时序由 `eframe` 定：每帧画之前调一次（[`eframe::App::raw_input_hook`]），
+    /// 所以这里塞进去的事件与同一帧的键盘事件走同一条路。同一段字只在它变化的那一帧
+    /// 产出一次注入（拿着焦点的那一个输入框收到它们）。
+    ///
+    /// 是 `pub` 因为 Android 那条读法（`GameActivity` 的 C 接口）只能在 `android_main`
+    /// 里拿到，集成测试只能直接喂快照正文；桌面运行时没有第二个人调它。
+    pub fn apply_ime_snapshot(
+        &mut self,
+        raw_input: &mut egui::RawInput,
+        text: &str,
+        compose: Option<(usize, usize)>,
+    ) {
+        let (actions, committed) = crate::ime::injections(&self.ime_committed, text, compose);
+        self.ime_committed = committed;
+
+        // 这一帧已经收到键盘的退格时不再补退格：输入法删字可能既走 `sendKeyEvent`
+        // （→ winit → `Key::Backspace`）又改快照，两边都注入就一按删两个字
+        let keyboard_backspace = raw_input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    pressed: true,
+                    ..
+                }
+            )
+        });
+        for action in actions {
+            match action {
+                crate::ime::Injection::Text(text) => raw_input.events.push(egui::Event::Text(text)),
+                // 退格造一个按键事件：文本编辑器认的就是它（输入法删字走的是
+                // `deleteSurroundingText`，不是键盘事件）
+                crate::ime::Injection::Backspace(count) if !keyboard_backspace => {
+                    for _ in 0..count {
+                        raw_input.events.push(egui::Event::Key {
+                            key: egui::Key::Backspace,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::default(),
+                        });
+                    }
+                }
+                crate::ime::Injection::Backspace(_) => {}
+            }
+        }
     }
 
     /// 解锁成功之后进入主界面：读今天所在的那一页
@@ -954,7 +1003,7 @@ impl App {
                 );
 
                 theme::column(ui, shell::COLUMN_WIDTH, |ui| {
-                    diary.show(ui, sheet, selected)
+                    diary.show(ui, sheet, selected, shell::Chrome::of(narrow))
                 })
             })
             .inner;
@@ -1026,28 +1075,15 @@ impl eframe::App for App {
         self.flush();
     }
 
-    /// 输入法上屏的字：Android 的 JNI 桥推进 [`PENDING_TEXT`]，这里注入成 `egui` 的文本事件。
+    /// 输入法上屏的字：Android 的软键盘不走 `KeyEvent`，它的 `TextEvent` 又不被 winit 消费，
+    /// 所以这里每帧读一次 game-activity 的文本快照，与上一帧比出差量，注入成 `egui` 事件。
     ///
     /// `eframe` 每帧画之前调它（`prepare_raw_input`），所以注入的字和这一帧的键盘事件
-    /// 走同一条路：该落的输入框、该动的光标都跟手敲的一样。桌面队列永远是空的。
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        for input in take_input() {
-            match input {
-                PendingInput::Text(text) => raw_input.events.push(egui::Event::Text(text)),
-                // 退格造一个按键事件：文本编辑器认的就是它，与手敲退格没有区别
-                PendingInput::Backspace(count) => {
-                    for _ in 0..count {
-                        raw_input.events.push(egui::Event::Key {
-                            key: egui::Key::Backspace,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: egui::Modifiers::default(),
-                        });
-                    }
-                }
-            }
-        }
+    /// 走同一条路：该落的输入框、该动的光标都跟手敲的一样。
+    /// 桌面没有输入法源（`App::with_ime_source` 是 Android 独有），这里是空转。
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {
+        #[cfg(target_os = "android")]
+        self.inject_ime_events(_ctx, _raw_input);
     }
 
     /// 不把 egui 的内存写进持久化文件。
@@ -1057,6 +1093,148 @@ impl eframe::App for App {
     /// [`eframe::App::save`] 这个钩子。
     fn persist_egui_memory(&self) -> bool {
         false
+    }
+}
+
+/// Android 独有：从 game-activity 读输入法快照。
+///
+/// 差分与注入在 [`App::apply_ime_snapshot`]，这里负责“把快照读出来”、
+/// “告诉输入法当前是什么输入框”与“该画的时候画一帧”。
+#[cfg(target_os = "android")]
+impl App {
+    /// 有输入框在焦点上时多久自己排一帧。
+    ///
+    /// 输入法上屏不会给应用发任何 winit 事件（字只进 game-activity 的快照），
+    /// 不自己排帧的话，一段上屏的字要等到下一次别的输入才画出来。
+    /// 200 毫秒是人眼看上去“跟手”的上限，也是这条取舍的代价：打字期间每秒多画几帧。
+    const IME_POLL_MILLIS: u64 = 200;
+
+    /// 取 native handle 的重试上限（帧数）。前面的 SQLite 打开与迁移已经把
+    /// `initializeNativeCode` 那点“先起 `android_main`、后写静态字段”的窗口盖过去了，
+    /// 实际上第一次就拿到；这个上限只是别让它在异常情况下每帧去问 JNI。
+    const IME_HANDLE_TRIES: u32 = 120;
+
+    /// 读一次输入法快照，交给 [`App::apply_ime_snapshot`]，并安排下一次读。
+    ///
+    /// 快照的读法在 [`crate::android::ime_snapshot`]（只读，不改状态）：**不要**换成
+    /// `AndroidApp::text_input_state()`——它内部那个读法在输入法还没推过东西时会 `abort`。
+    /// 取不到 handle 或这一次读不出来就什么都不做，下一帧再试（只读不清标志，不会丢字）。
+    fn inject_ime_events(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.ime_source.is_none() {
+            return;
+        }
+        // 有没有输入框在等着打字。**不要**读 `ctx.output()`：帧外读到的是被 take 走的空输出
+        // （`ime` 永远是 `None`）。`text_edit_focused` 是"有焦点、且是 TextEdit"。
+        let want_ime = ctx.text_edit_focused();
+        self.ensure_ime_handle();
+        self.sync_ime_editor_info();
+
+        if let Some((text, compose)) = self.ime_handle.and_then(crate::android::ime_snapshot) {
+            self.apply_ime_snapshot(raw_input, &text, compose);
+        }
+
+        if want_ime {
+            ctx.request_repaint_after(Duration::from_millis(Self::IME_POLL_MILLIS));
+        }
+    }
+
+    /// 拿到 AGDK 的 native handle（一次就够，同一个进程里它是不变的）。
+    ///
+    /// 取不到就前 [`Self::IME_HANDLE_TRIES`] 帧反复试（见 [`App::with_ime_source`] 的时序；
+    /// 0 也算取不到，`native_handle` 会把它滤掉）；到上限只记一条 warn 并放弃——
+    /// 中文上屏不工作，应用照常跑。
+    fn ensure_ime_handle(&mut self) {
+        if self.ime_handle.is_some() || self.ime_handle_tries > Self::IME_HANDLE_TRIES {
+            return;
+        }
+        let Some(source) = self.ime_source.as_ref() else {
+            return;
+        };
+        self.ime_handle = crate::android::native_handle(source);
+        if self.ime_handle.is_some() {
+            return;
+        }
+        self.ime_handle_tries += 1;
+        if self.ime_handle_tries > Self::IME_HANDLE_TRIES {
+            log::warn!("拿不到 game-activity 的 native handle：手机上中文上屏不会工作");
+        }
+    }
+
+    /// 当前这一屏该给输入法哪种编辑器。
+    ///
+    /// 不给的话 `inputType` 是 0（`TYPE_NULL`），输入法只能摆一个数字/符号键盘——
+    /// 真机上量到过，拼音一个字都打不出来。
+    fn wanted_ime_kind(&self) -> ImeKind {
+        match self.stage {
+            Stage::Setup | Stage::Unlock => ImeKind::Password,
+            Stage::Ready if self.overlay_open => ImeKind::Text,
+            Stage::Ready => ImeKind::Multiline,
+        }
+    }
+
+    /// 编辑器的大类变了就告诉输入法。
+    ///
+    /// `set_ime_editor_info` 只改 AGDK 手里那份 `EditorInfo`，输入法下次建连接时才看得到；
+    /// 而这恰好就是它被叫起来的时候：`egui` 那边给焦点时会走 `show_soft_input` → AGDK 内部
+    /// `restartInput` → 框架重新问一次连接，新的 `EditorInfo` 就在那一次交给它。
+    ///
+    /// **不要在这里自己调 `show_soft_input`**：真机上量到过——紧接着 `restartInput` 的那次
+    /// 改动会让系统把刚排上的那次显示取消掉（`ImeTracker: onCancelled at
+    /// PHASE_CLIENT_ON_CONTROLS_CHANGED`），键盘反而弹不出来。
+    fn sync_ime_editor_info(&mut self) {
+        let Some(source) = self.ime_source.as_ref() else {
+            return;
+        };
+        let want = self.wanted_ime_kind();
+        if self.ime_kind == Some(want) {
+            return;
+        }
+        source.set_ime_editor_info(want.input_type(), ImeKind::ACTION, ImeKind::OPTIONS);
+        self.ime_kind = Some(want);
+    }
+}
+
+/// 输入框的大类——决定给输入法的 `inputType`。
+///
+/// 编辑器的细类（密码变体、多行旗标）由 `egui` 那边的 `TextEdit` 决定，
+/// 这里只按“当前是哪一屏、浮层开着没有”分类：
+/// 密码那两屏不弹候选、不记词；正文要多行且**要**留中文候选。
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImeKind {
+    /// 主密码：普通文本 + 不要候选
+    Password,
+    /// 单行文本（搜索框）
+    Text,
+    /// 正文：多行 + 允许候选
+    Multiline,
+}
+
+#[cfg(target_os = "android")]
+impl ImeKind {
+    /// 回车键不交给输入法处理：`egui` 那边只把回车当普通按键（搜索是防抖的，不用回车确认）
+    const ACTION: winit::platform::android::activity::input::TextInputAction =
+        winit::platform::android::activity::input::TextInputAction::None;
+
+    /// 不许输入法进“全屏提取”模式。
+    ///
+    /// 不给这一条时真机上是这个现象：IME 窗口请求整屏高度、键盘一个像素都画不出来
+    /// （系统里 Settings 的搜索框就是带着这一条才弹得出来的）。
+    const OPTIONS: winit::platform::android::activity::input::ImeOptions =
+        winit::platform::android::activity::input::ImeOptions::IME_FLAG_NO_FULLSCREEN;
+
+    fn input_type(self) -> winit::platform::android::activity::input::InputType {
+        use winit::platform::android::activity::input::InputType;
+        match self {
+            // **不要**用 `TYPE_TEXT_VARIATION_PASSWORD`：vivo 会把带密码变体的编辑器路由给自家的
+            // 安全输入法（`com.vivo.secime.service`），那套在这台机器上每次都是
+            // `TYPE_SHOW - STATUS_FAIL`，键盘根本弹不出来（真机上量到过）。
+            // `NO_SUGGESTIONS` 不是密码变体，不触发那条路由；它挡的是“输入法把主密码学进词库”。
+            Self::Password => InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_FLAG_NO_SUGGESTIONS,
+            Self::Text => InputType::TYPE_CLASS_TEXT,
+            // 多行：拼音候选要留着（日记正文）
+            Self::Multiline => InputType::TYPE_CLASS_TEXT | InputType::TYPE_TEXT_FLAG_MULTI_LINE,
+        }
     }
 }
 
