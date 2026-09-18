@@ -5,6 +5,7 @@
 //! 想换存储引擎（比如换成文件、换成本地服务），再实现一次这个 trait 就够了。
 
 use crate::model::{Change, MonthKey, MonthSheet};
+use crate::search::SearchResults;
 use std::collections::BTreeMap;
 
 pub mod sqlite;
@@ -49,6 +50,14 @@ pub trait Vault {
 
     /// 一次事务写一批编辑（未解锁时返回 [`StoreError::Locked`]）
     fn apply(&mut self, changes: &[Change]) -> Result<(), StoreError>;
+
+    /// 全库搜索：正文里含 `needle` 的那些天，按日期从新到旧，一天最多一条，
+    /// 最多 [`crate::search::MAX_HITS`] 天。
+    ///
+    /// `needle` 去掉首尾空白后为空时返回空结果（不碰磁盘）；未解锁返回 [`StoreError::Locked`]；
+    /// 某一天的密文解不开返回 [`StoreError::Corrupt`]（与 [`Vault::load_month`] 同一口径：
+    /// 宁可报错，不要悄悄少几天）。
+    fn search(&self, needle: &str) -> Result<SearchResults, StoreError>;
 }
 
 /// 同一批编辑里同一天只留最后一次。

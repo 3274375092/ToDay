@@ -202,6 +202,9 @@ pub fn status_bar(ui: &mut Ui, month: MonthKey, written: usize) {
                 theme::Piece::text("下一行", theme::sans(11.5), theme::FAINT).gap(6.0),
                 theme::Piece::key("右键").gap(18.0),
                 theme::Piece::text("删除这一天", theme::sans(11.5), theme::FAINT).gap(6.0),
+                theme::Piece::key(COMMAND_KEY).gap(18.0),
+                theme::Piece::key("F").gap(4.0),
+                theme::Piece::text("搜索", theme::sans(11.5), theme::FAINT).gap(6.0),
             ],
         );
     });

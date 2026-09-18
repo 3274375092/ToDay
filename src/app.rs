@@ -8,12 +8,16 @@
 //!   （不再排帧、不再自动重试）。再试一次的入口都是用户的动作：点"重试"、
 //!   再敲一个字、换日期或翻月份、关窗与锁定时的落盘。
 //!
+//! 搜索走 [`SearchScheduler`]：查询安静 0.25 秒才扫一次库，扫之前先把待写的编辑落盘。
+//!
 //! 密码只在这里出现一瞬（从视图取出来交给存储层），控制器自己不持有密钥。
 
 use crate::model::{Change, MonthKey, MonthSheet};
+use crate::search::{self, SearchResults};
 use crate::store::{StoreError, Vault};
 use crate::ui::calendar::Calendar;
 use crate::ui::diary::{self, Diary, DiaryEvent};
+use crate::ui::search::{Results, SearchRow, SearchView};
 use crate::ui::shell::{self, Edge, SaveState, ShellAction};
 use crate::ui::theme;
 use crate::ui::unlock::{UnlockMode, UnlockView};
@@ -26,6 +30,9 @@ use std::time::Duration;
 
 /// 打字安静多久之后落盘
 pub const SAVE_DEBOUNCE_SECONDS: f64 = 0.4;
+
+/// 查询安静多久之后真的去搜一次
+pub const SEARCH_DEBOUNCE_SECONDS: f64 = 0.25;
 
 /// 落盘节流。
 ///
@@ -94,6 +101,57 @@ impl SaveScheduler {
     }
 }
 
+/// 搜索防抖。
+///
+/// 纯逻辑，不碰 IO：查询改了就重新计时，安静够久了才真的扫一次库。
+/// 一帧最多搜一次；没有改动就不搜。
+#[derive(Debug, Default)]
+pub struct SearchScheduler {
+    /// 查询改过、还没搜
+    dirty: bool,
+    /// 查询最后一次改动的时刻（`InputState::time`，秒）
+    changed_at: f64,
+}
+
+impl SearchScheduler {
+    /// 记一次查询改动
+    pub fn record(&mut self, now: f64) {
+        self.dirty = true;
+        self.changed_at = now;
+    }
+
+    /// 到点了吗：查询改过，而且安静够久了
+    pub fn is_due(&self, now: f64) -> bool {
+        self.dirty && now - self.changed_at >= SEARCH_DEBOUNCE_SECONDS
+    }
+
+    /// 离到点还有多久（已经到点就是 0）
+    pub fn time_until_due(&self, now: f64) -> f64 {
+        (SEARCH_DEBOUNCE_SECONDS - (now - self.changed_at)).max(0.0)
+    }
+
+    /// 搜过了（或查询空到不必搜）：在下次改动之前不再到点
+    pub fn mark_searched(&mut self) {
+        self.dirty = false;
+    }
+
+    /// 现在排下一帧有意义吗：查询改过、还没搜。
+    ///
+    /// 返回 `false` 时排帧也不会发生搜索，调用方不要排帧。
+    pub fn needs_wakeup(&self) -> bool {
+        self.dirty
+    }
+}
+
+/// 跳转之后要落下的选区。
+///
+/// 只有目标月的缓存真的到位了才用得上；换页失败时根本不置它（红条已经说明了原因）。
+struct PendingJump {
+    date: NaiveDate,
+    /// 命中那一段在正文里的字符区间
+    range: std::ops::Range<usize>,
+}
+
 /// 界面现在停在哪一步
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
@@ -137,6 +195,18 @@ pub struct App {
     calendar: Calendar,
     diary: Diary,
     scheduler: SaveScheduler,
+    /// 侧栏搜索框与结果卡片
+    search: SearchView,
+    /// 最近一次搜索的结果（命中按日期从新到旧，附“是不是被截了”）
+    hits: SearchResults,
+    /// `hits` 是对哪个查询搜出来的（`None` = 还没搜过）
+    hit_query: Option<String>,
+    /// 最近一次搜索失败了
+    hit_failed: bool,
+    /// 搜索防抖
+    search_scheduler: SearchScheduler,
+    /// 跳转之后要落下的选区
+    pending_jump: Option<PendingJump>,
     /// 最近一次失败，显示在顶栏下面
     error: Option<Fault>,
     /// 窗口尺寸记忆的落盘位置；不设就完全不碰窗口状态（测试与嵌入式用法）
@@ -164,6 +234,12 @@ impl App {
             calendar: Calendar::new(today).with_selected(today),
             diary: Diary::new(),
             scheduler: SaveScheduler::default(),
+            search: SearchView::new(),
+            hits: SearchResults::default(),
+            hit_query: None,
+            hit_failed: false,
+            search_scheduler: SearchScheduler::default(),
+            pending_jump: None,
             error: None,
             window_memory: None,
         })
@@ -185,6 +261,7 @@ impl App {
         self.unlock.clear();
         self.diary = Diary::new();
         self.scheduler = SaveScheduler::default();
+        self.clear_search();
         self.date = today;
         self.calendar.select(today);
         self.load_month(MonthKey::from_date(today));
@@ -290,6 +367,118 @@ impl App {
         }
     }
 
+    /// 到点了：先落盘，再全库搜一次。
+    ///
+    /// 先 [`App::flush`] 是让搜索看到磁盘上真实的样子（刚敲的那句也在里面）；
+    /// 写失败不拦住读——错误条照旧显示，搜索照样跑。
+    /// 搜过之后在下次改动前不再到点；空查询不碰磁盘。
+    fn run_search(&mut self) {
+        self.search_scheduler.mark_searched();
+        let query = self.search.query().trim().to_owned();
+        if query.is_empty() {
+            self.drop_hits();
+            return;
+        }
+
+        // `flush` 的返回值要留着判红条该归谁（见下）
+        let saved = self.flush();
+        match self.vault.search(&query) {
+            Ok(hits) => {
+                self.hits = hits;
+                self.hit_failed = false;
+            }
+            Err(err) => {
+                self.hits = SearchResults::default();
+                self.hit_failed = true;
+                // 这一次落盘也失败了就不改 `error`：红条上正写着"重试"，
+                // 换成搜索的错会让用户以为问题只是查询没成，
+                // 而正文其实还压在队里没写进去。写盘那条更急，留它
+                if saved {
+                    self.error = Some(Fault::Other(err.to_string()));
+                }
+            }
+        }
+        self.hit_query = Some(query);
+    }
+
+    /// 丢掉手里的命中：查询清空、锁定之后，内存里不该还留着正文摘要
+    fn drop_hits(&mut self) {
+        self.hits = SearchResults::default();
+        self.hit_query = None;
+        self.hit_failed = false;
+    }
+
+    /// 搜索状态整个清干净：查询、命中、卡片、防抖计时（锁定与解锁都走它）
+    fn clear_search(&mut self) {
+        self.search.clear();
+        self.drop_hits();
+        self.pending_jump = None;
+        self.search_scheduler = SearchScheduler::default();
+    }
+
+    /// 打开卡片里的一行：日期行直接跳过去，命中行跳到那天并把那一句选上。
+    ///
+    /// 命中下标是某一次搜索的结果：查询改过、或上次搜索失败时它已经失效，
+    /// 这时只当没点（卡片这一帧显示的也不是这些命中）。
+    fn open_row(&mut self, row: SearchRow) {
+        match row {
+            SearchRow::Date(date) => {
+                self.pending_jump = None;
+                self.go_to(date);
+                self.search.close();
+            }
+            SearchRow::Hit(index) => {
+                let current = self.search.query().trim();
+                if self.hit_failed || self.hit_query.as_deref() != Some(current) {
+                    return;
+                }
+                let (date, range) = match self.hits.hits.get(index) {
+                    Some(hit) => (hit.date, hit.char_range()),
+                    None => return,
+                };
+                self.open_hit(date, range);
+            }
+        }
+    }
+
+    /// 跳到命中的那一天，并把命中那一段选上（焦点交给那一行）。
+    ///
+    /// 只有目标月的缓存真的换过去了才置 `pending_jump`：换页失败（写盘失败）时
+    /// 红条已经说明了原因，这里不起跳，用户的下一个动作还能重来。
+    fn open_hit(&mut self, date: NaiveDate, range: std::ops::Range<usize>) {
+        self.go_to(date);
+        self.pending_jump =
+            (self.sheet.key() == MonthKey::from_date(date)).then_some(PendingJump { date, range });
+        // 卡片收起、查询留着：再聚焦就能回到这张结果表
+        self.search.close();
+    }
+
+    /// 把 `pending_jump` 里的选区种进那一行的输入框状态，并把焦点交给它。
+    ///
+    /// 必须在正文画完之后调（见 `diary_screen` 里的调用点）：`TextEdit` 重建时会把
+    /// 已有的非空选区塌成一个点，先种下去会被同一帧抹掉，用户看不到选中的那句。
+    ///
+    /// 换页失败时 `sheet` 还是旧的那一页，这里就什么都不做（`open_hit` 本来也没置
+    /// `pending_jump`；这里是第二道阑，防着日期与缓存对不上）。
+    fn apply_pending_jump(&mut self, ctx: &egui::Context) {
+        let Some(jump) = self.pending_jump.take() else {
+            return;
+        };
+        if self.sheet.key() != MonthKey::from_date(jump.date) {
+            return;
+        }
+        let id = diary::row_id(jump.date);
+        let mut state = egui::widgets::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(jump.range.start),
+                egui::text::CCursor::new(jump.range.end),
+            )));
+        state.store(ctx, id);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+    }
+
     /// 关窗请求：先记下窗口尺寸，再把攒着的东西写完，最后放行。
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.viewport().close_requested()) {
@@ -352,6 +541,8 @@ impl App {
         self.sheet = MonthSheet::empty(self.month);
         self.diary = Diary::new();
         self.scheduler = SaveScheduler::default();
+        // 查询与命中摘要也一起清：锁上之后内存里不该留着任何一个字
+        self.clear_search();
         self.unlock.clear();
         diary::forget_text_edits(ctx);
     }
@@ -423,6 +614,21 @@ impl App {
     /// 主界面
     fn diary_screen(&mut self, ui: &mut egui::Ui) {
         let today = Local::now().date_naive();
+        let now = ui.input(|i| i.time);
+
+        // ── 搜索的快捷键与到点的那次扫库，都排在画界面之前 ──
+        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+            self.search.focus();
+        }
+        // 卡片开着时 `Esc` 一律收起，不看焦点在不在搜索框：
+        // 跳过一次之后焦点在正文那一行上，这时用户想收掉卡片也该能按 Esc。
+        // 收掉的是查询、命中与卡片，再 Ctrl+F 是从空白开始
+        if self.search.open() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.clear_search();
+        }
+        if self.search_scheduler.is_due(now) {
+            self.run_search();
+        }
 
         let mut action = ShellAction::default();
 
@@ -477,12 +683,13 @@ impl App {
             .show(ui, |ui| shell::status_bar(ui, self.month, self.sheet.len()));
         shell::edge_line(ui, bar.response.rect, Edge::Top);
 
-        // ── 侧栏：日历 ──
-        let (month, written, marked, calendar) = (
+        // ── 侧栏：搜索框 + 日历 ──
+        let (month, written, marked, calendar, search) = (
             self.month,
             self.sheet.len(),
             self.sheet.marked(),
             &mut self.calendar,
+            &mut self.search,
         );
         let bar = egui::Panel::left("sidebar")
             .exact_size(shell::SIDEBAR_WIDTH)
@@ -503,17 +710,42 @@ impl App {
                     egui::Color32::from_rgba_unmultiplied(0xD8, 0xC7, 0x9E, 16),
                 );
 
+                // 搜索排在日历上面：
+                // 日历回答"去哪一天"，搜索回答"那句话在哪"，找一句话不必先翻到那个月
+                let action = search.field(ui);
+                ui.add_space(14.0);
+
                 let before = calendar.displayed_month();
                 let picked = calendar.show(ui, &marked);
                 // 页脚只有本月记录与进度条：回到今天在顶栏那枚，不在左下角重复
                 shell::sidebar_footer(ui, month, written);
                 // 翻页键与跨月的日子都在 `show` 里改日历自己那个月：
                 // 这一帧翻没翻，只有在里面比过才知道
-                (picked, calendar.displayed_month() != before)
+                (action, picked, calendar.displayed_month() != before)
             });
         shell::edge_line(ui, bar.response.rect, Edge::Right);
 
-        let (picked, turned) = bar.inner;
+        // 查询改了 / 被清掉：命中的存废与防抖计时都跟着走
+        let (search_action, picked, turned) = bar.inner;
+        // 被清掉优先于被改过：删掉最后一个字时 `changed` 与 `dismissed` 会同时为真
+        // （见 `SearchView::field` 里的 `emptied`），而清掉是更强的意图——
+        // 先走它，下面那个空查询分支就不必再兼顾“查询没了”这一种情况
+        if search_action.dismissed {
+            self.search.clear();
+            self.drop_hits();
+        } else if search_action.changed {
+            if self.search.query().trim().is_empty() {
+                // 查询空了就没什么可搜的，手里的命中也不留
+                self.search_scheduler.mark_searched();
+                self.drop_hits();
+            } else {
+                self.search_scheduler.record(now);
+            }
+        }
+        if let Some(row) = search_action.open {
+            self.open_row(row);
+        }
+
         if let Some(date) = picked {
             // 点中的日子可能不在本月：换页交给 `go_to`（它先把旧页写完）
             self.go_to(date);
@@ -555,12 +787,45 @@ impl App {
 
         self.handle_diary_event(event, ui.ctx());
 
+        // ── 跳到命中：把选区种进那一行的输入框状态，焦点也交给它 ──
+        // 必须排在正文画完之后：`TextEdit` 每帧重建时会把已有的非空选区塌成
+        // 一个点（`builder.rs` 里进事件处理之前那段），先种下去会被同一帧抹掉。
+        // 放在这里，种的选区下一帧才被读，重建反而看不见它。
+        // egui 只在输入框有焦点时画选区，所以焦点必须过去；
+        // 接着打字就是替换选中的那句，与编辑器 / 浏览器查找一致
+        self.apply_pending_jump(ui.ctx());
+
+        // ── 搜索结果卡片：正文画完再浮上来 ──
+        // 命中行里的摘要是按卡片宽度排的，所以它排在正文后面
+        let query = self.search.query().trim();
+        let jump = search::date_query(query);
+        let results =
+            if self.search_scheduler.needs_wakeup() || self.hit_query.as_deref() != Some(query) {
+                // 防抖期间、或查询刚改过：不拿旧结果冒充
+                Results::Pending
+            } else if self.hit_failed {
+                Results::Failed
+            } else {
+                Results::Ready(&self.hits.hits, self.hits.truncated)
+            };
+        if let Some(row) = self.search.results(ui.ctx(), jump, results) {
+            self.open_row(row);
+        }
+
         // ── 顶栏 / 页脚表达的意图 ──
         if action.goto_today {
             self.go_to(today);
         }
         if action.lock {
             self.lock(ui.ctx());
+        }
+
+        // 查询刚改过：排到点那一帧去搜（那次搜索在下一帧帧首）；
+        // 没改动就一帧都不多排
+        if self.search_scheduler.needs_wakeup() {
+            let wait = self.search_scheduler.time_until_due(now).max(0.01);
+            ui.ctx()
+                .request_repaint_after(Duration::from_secs_f64(wait));
         }
     }
 }
@@ -581,5 +846,46 @@ impl App {
             Stage::Setup | Stage::Unlock => self.password_screen(ui),
             Stage::Ready => self.diary_screen(ui),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_query_waits_for_the_debounce() {
+        let mut scheduler = SearchScheduler::default();
+        assert!(!scheduler.needs_wakeup(), "没改过就不用排帧");
+        assert!(!scheduler.is_due(100.0), "没改过就谈不上到点");
+
+        scheduler.record(10.0);
+        assert!(scheduler.needs_wakeup(), "改了就要排帧等到点");
+        assert!(!scheduler.is_due(10.0), "刚敲完不搜");
+        assert!(!scheduler.is_due(10.0 + SEARCH_DEBOUNCE_SECONDS - 0.01));
+        assert!(scheduler.is_due(10.0 + SEARCH_DEBOUNCE_SECONDS));
+
+        scheduler.mark_searched();
+        assert!(!scheduler.needs_wakeup(), "搜过了就不用再排帧");
+        assert!(!scheduler.is_due(999.0), "搜过之后在下次改动前不再到点");
+    }
+
+    #[test]
+    fn typing_again_restarts_the_timer() {
+        let mut scheduler = SearchScheduler::default();
+        scheduler.record(10.0);
+        scheduler.record(10.2);
+
+        assert!(!scheduler.is_due(10.3), "又敲了一个字，重新计时");
+        assert!(scheduler.is_due(10.45));
+    }
+
+    #[test]
+    fn the_remaining_wait_counts_down() {
+        let mut scheduler = SearchScheduler::default();
+        scheduler.record(10.0);
+
+        assert!((scheduler.time_until_due(10.1) - (SEARCH_DEBOUNCE_SECONDS - 0.1)).abs() < 1e-9);
+        assert_eq!(scheduler.time_until_due(99.0), 0.0, "已经到点就不要再等");
     }
 }

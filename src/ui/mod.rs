@@ -5,6 +5,7 @@
 
 pub mod calendar;
 pub mod diary;
+pub mod search;
 pub mod shell;
 pub mod theme;
 pub mod unlock;

@@ -1,6 +1,7 @@
 //! 存储层的验收：迁移、往返、锁、事务，以及"磁盘上读不到正文"。
 
 use ToDay::model::{Change, MonthKey, MonthSheet};
+use ToDay::search::MAX_HITS;
 use ToDay::store::sqlite::SqliteVault;
 use ToDay::store::{StoreError, Vault};
 use chrono::NaiveDate;
@@ -395,4 +396,127 @@ fn an_in_memory_vault_works_the_same() {
 
     vault.lock();
     assert!(matches!(vault.load_month(month()), Err(StoreError::Locked)));
+}
+
+#[test]
+fn search_finds_text_across_months_newest_first() {
+    let (_dir, mut vault) = unlocked();
+    let august = NaiveDate::from_ymd_opt(2025, 8, 20).unwrap();
+    vault
+        .apply(&[
+            Change::set(august, "八月写的咖啾"),
+            Change::set(date(3), "九月也写了咖啾"),
+            Change::set(date(17), "今天喝了咖啾"),
+        ])
+        .unwrap();
+
+    let found = vault.search("咖啾").unwrap();
+    let hits = &found.hits;
+    let dates: Vec<_> = hits.iter().map(|hit| hit.date).collect();
+    assert_eq!(
+        dates,
+        vec![date(17), date(3), august],
+        "跨月、按日期从新到旧"
+    );
+    assert_eq!(hits[0].matched, "咖啾");
+    assert_eq!(hits[0].at, 4, "命中位置按字符算");
+    assert_eq!(hits[0].char_range(), 4..6, "选中区间就是命中那两个字符");
+    assert_eq!(hits[0].before, "今天喝了");
+}
+
+#[test]
+fn search_gives_one_hit_per_day() {
+    let (_dir, mut vault) = unlocked();
+    vault
+        .apply(&[Change::set(date(3), "咖啾，又是咖啾")])
+        .unwrap();
+
+    let found = vault.search("咖啾").unwrap();
+    assert_eq!(found.hits.len(), 1, "一天最多一条");
+    assert_eq!(found.hits[0].at, 0, "取最靠前的那一处");
+}
+
+#[test]
+fn a_blank_needle_is_an_empty_search() {
+    let (_dir, mut vault) = unlocked();
+    vault.apply(&[Change::set(date(3), "写了点东西")]).unwrap();
+
+    assert!(vault.search("").unwrap().hits.is_empty());
+    assert!(
+        vault.search("  \n ").unwrap().hits.is_empty(),
+        "纯空白不碰磁盘"
+    );
+}
+
+#[test]
+fn a_locked_vault_refuses_to_search() {
+    let (_dir, mut vault) = unlocked();
+    vault
+        .apply(&[Change::set(date(3), "锁之前写的咖啾")])
+        .unwrap();
+    vault.lock();
+
+    assert!(matches!(vault.search("咖啾"), Err(StoreError::Locked)));
+}
+
+#[test]
+fn search_sees_the_latest_edit() {
+    let (_dir, mut vault) = unlocked();
+    vault.apply(&[Change::set(date(3), "咖啾")]).unwrap();
+    assert_eq!(vault.search("咖啾").unwrap().hits.len(), 1);
+
+    vault.apply(&[Change::set(date(3), "改成了茶")]).unwrap();
+    assert!(
+        vault.search("咖啾").unwrap().hits.is_empty(),
+        "搜到的该是新内容"
+    );
+    assert_eq!(vault.search("茶").unwrap().hits.len(), 1);
+}
+
+#[test]
+fn search_keeps_only_the_newest_days_up_to_the_cap() {
+    let (_dir, mut vault) = unlocked();
+    let start = date(1);
+    let changes: Vec<Change> = (0..MAX_HITS + 5)
+        .map(|offset| {
+            let day = start + chrono::Duration::days(offset as i64);
+            Change::set(day, format!("第 {offset} 天写了咖啾"))
+        })
+        .collect();
+    vault.apply(&changes).unwrap();
+
+    let found = vault.search("咖啾").unwrap();
+    let hits = &found.hits;
+    assert_eq!(hits.len(), MAX_HITS, "最多留最近 {MAX_HITS} 天");
+    assert!(found.truncated, "库里还有更老的命中没列出来，该报被截了");
+    assert_eq!(
+        hits[0].date,
+        start + chrono::Duration::days((MAX_HITS + 4) as i64),
+        "留下的是最近的"
+    );
+    assert!(
+        hits.windows(2).all(|pair| pair[0].date > pair[1].date),
+        "仍然是按日期从新到旧"
+    );
+}
+
+/// 命中数恰好等于上限、库里也确实只有这么多：不该说“被截了”。
+#[test]
+fn exactly_the_cap_is_not_truncation() {
+    let (_dir, mut vault) = unlocked();
+    let start = date(1);
+    let changes: Vec<Change> = (0..MAX_HITS)
+        .map(|offset| {
+            let day = start + chrono::Duration::days(offset as i64);
+            Change::set(day, format!("第 {offset} 天写了咖啾"))
+        })
+        .collect();
+    vault.apply(&changes).unwrap();
+
+    let found = vault.search("咖啾").unwrap();
+    assert_eq!(found.hits.len(), MAX_HITS, "正好 {MAX_HITS} 天");
+    assert!(
+        !found.truncated,
+        "恰好这么多就不该说被截了（界面正是靠这个标志决定说不说）"
+    );
 }

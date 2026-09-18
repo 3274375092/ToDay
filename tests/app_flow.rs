@@ -6,9 +6,11 @@
 
 use ToDay::app::App;
 use ToDay::model::{Change, MonthKey, MonthSheet};
+use ToDay::search;
 use ToDay::store::StoreError;
 use ToDay::store::Vault;
 use ToDay::store::sqlite::SqliteVault;
+use ToDay::ui::search::SEARCH_FIELD_ID;
 use ToDay::ui::{diary, theme, unlock};
 use chrono::{Local, NaiveDate};
 use egui::widgets::text_edit::TextEditState;
@@ -81,6 +83,42 @@ impl Frame {
             .push(Event::ModifiersChanged(egui::Modifiers::COMMAND));
         self.events
             .push(key_event(Key::Enter, egui::Modifiers::COMMAND));
+        self
+    }
+
+    /// Ctrl（macOS 上是 Cmd）+ F：聚焦搜索框
+    fn command_f(mut self) -> Self {
+        self.events
+            .push(Event::ModifiersChanged(egui::Modifiers::COMMAND));
+        self.events
+            .push(key_event(Key::F, egui::Modifiers::COMMAND));
+        self
+    }
+
+    fn escape(mut self) -> Self {
+        self.events
+            .push(key_event(Key::Escape, egui::Modifiers::default()));
+        self
+    }
+
+    /// 退格删掉一个字符（单行输入框里的常规写法）
+    fn backspace(mut self) -> Self {
+        self.events
+            .push(key_event(Key::Backspace, egui::Modifiers::default()));
+        self
+    }
+
+    /// 在某个位置点一下鼠标（按下 + 抬起）
+    fn click(mut self, pos: egui::Pos2) -> Self {
+        self.events.push(Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            self.events.push(Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
         self
     }
 
@@ -187,6 +225,33 @@ fn texts(output: &egui::FullOutput) -> String {
     out
 }
 
+/// 从这一帧画出来的文字里找一段，给出它在屏幕上的位置。
+///
+/// 同一段文字可能在正文里也出现一次：浮层卡片画在 `Foreground`，排在最后，所以取最后一个匹配。
+fn last_text_pos(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+    fn collect(shape: &egui::Shape, needle: &str, out: &mut Option<egui::Pos2>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                if text.galley.text() == needle {
+                    *out = Some(text.pos);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, needle, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut found = None;
+    for clipped in &output.shapes {
+        collect(&clipped.shape, needle, &mut found);
+    }
+    found
+}
+
 /// 本月的第一天与"今天"，用来定位缓存的月份与行
 fn today() -> NaiveDate {
     Local::now().date_naive()
@@ -223,14 +288,27 @@ fn open_the_unlock_screen(ctx: &egui::Context, app: &mut App) {
     );
 }
 
+/// 替身在库里做过的动作，按发生顺序记
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Act {
+    Apply(Vec<Change>),
+    Search(String),
+}
+
 /// 替身里能被测试读到的部分：`App` 拿走 `Box<dyn Vault>` 的所有权，
 /// 断言只能落在共享的这份记录上。
 #[derive(Default)]
 struct Spy {
     /// 每次 `apply` 收到的批次，按顺序记下来
     applied: Vec<Vec<Change>>,
+    /// 每次 `search` 收到的查询（含失败的那几次）
+    searches: Vec<String>,
+    /// `apply` 与 `search` 的先后顺序：盯住"搜索之前先落盘"
+    log: Vec<Act>,
     /// 接下来几次 `apply` 要失败（每失败一次减一）
     fail_next: usize,
+    /// 接下来几次 `search` 要失败（每失败一次减一）
+    fail_searches: usize,
     /// 接下来几次 `load_month` 要失败（每失败一次减一）
     fail_loads: usize,
     /// `lock()` 被调了几次
@@ -280,6 +358,7 @@ impl Vault for FakeVault {
     fn apply(&mut self, changes: &[Change]) -> Result<(), StoreError> {
         let mut spy = self.spy.borrow_mut();
         spy.applied.push(changes.to_vec());
+        spy.log.push(Act::Apply(changes.to_vec()));
         if spy.fail_next > 0 {
             spy.fail_next -= 1;
             return Err(StoreError::Corrupt("替身装的写盘失败".to_owned()));
@@ -295,6 +374,28 @@ impl Vault for FakeVault {
             }
         }
         Ok(())
+    }
+
+    fn search(&self, needle: &str) -> Result<search::SearchResults, StoreError> {
+        let mut spy = self.spy.borrow_mut();
+        spy.searches.push(needle.to_owned());
+        spy.log.push(Act::Search(needle.to_owned()));
+        if spy.fail_searches > 0 {
+            spy.fail_searches -= 1;
+            return Err(StoreError::Corrupt("替身搜不了".to_owned()));
+        }
+
+        // 与 SQLite 侧同一套规则：按日期从新到旧，最多 `MAX_HITS` 天；
+        // 多出来的那些说明被截了
+        let mut hits: Vec<search::Hit> = spy
+            .entries
+            .iter()
+            .filter_map(|(date, text)| search::hit(*date, text, needle))
+            .collect();
+        hits.sort_by_key(|hit| std::cmp::Reverse(hit.date));
+        let truncated = hits.len() > search::MAX_HITS;
+        hits.truncate(search::MAX_HITS);
+        Ok(search::SearchResults { hits, truncated })
     }
 }
 
@@ -952,4 +1053,405 @@ fn closing_without_window_memory_writes_nothing() {
         frame(0.0).window((1200.0, 800.0), false).closing(),
     );
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+/// Ctrl/Cmd+F 聚焦搜索框；接着打字就搜。
+#[test]
+fn command_f_focuses_the_search_box() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    spy.borrow_mut()
+        .entries
+        .insert(today(), "今天喝了咖啡".to_owned());
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+
+    run(&ctx, &mut app, frame(0.5).command_f());
+    assert_eq!(
+        ctx.memory(|memory| memory.focused()),
+        Some(field),
+        "Ctrl+F 该把焦点交给搜索框"
+    );
+
+    run(&ctx, &mut app, frame(0.6).text("咖啡"));
+    let found = texts(&run_output(&ctx, &mut app, frame(0.9)));
+    assert!(found.contains("找到 1 天"), "{found}");
+}
+
+/// 防抖没到点不搜；到点搜一次，卡片上出现日期戳与摘要。
+#[test]
+fn typing_in_the_search_box_waits_for_the_debounce_then_lists_hits() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    let day = today();
+    spy.borrow_mut()
+        .entries
+        .insert(day, "今天喝了咖啡".to_owned());
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+
+    // 打字：防抖期间不碰库，卡片说"搜索中…"
+    run(&ctx, &mut app, frame(0.5).focused_on(field).text("咖啡"));
+    assert!(spy.borrow().searches.is_empty(), "防抖没到点就不该搜");
+    // 卡片第一帧只做尺寸测量（egui 的 Area 如此），下一帧才真的画出来
+    let pending = texts(&run_output(&ctx, &mut app, frame(0.55).focused_on(field)));
+    assert!(pending.contains("搜索中…"), "{pending}");
+
+    // 安静 0.25 秒之后再搜：卡片给这一天，带日期戳与摘要
+    let found = texts(&run_output(&ctx, &mut app, frame(0.8).focused_on(field)));
+    assert_eq!(spy.borrow().searches, vec!["咖啡".to_owned()]);
+    assert!(found.contains("找到 1 天"), "{found}");
+    assert!(
+        found.contains(&day.format("%Y.%m.%d").to_string()),
+        "卡片上要有日期戳：{found}"
+    );
+    assert!(found.contains("今天喝了咖啡"), "卡片上要有摘要：{found}");
+}
+
+/// 点卡片上的命中：正文跳到那天、命中那一段被选上、焦点交给那一行。
+#[test]
+fn clicking_a_hit_selects_it_in_the_diary() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    let day = today();
+    spy.borrow_mut()
+        .entries
+        .insert(day, "今天喝了咖啡".to_owned());
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+
+    run(&ctx, &mut app, frame(0.5).focused_on(field).text("咖啡"));
+    let card = run_output(&ctx, &mut app, frame(0.8).focused_on(field));
+    let pos = last_text_pos(&card, "今天喝了咖啡").expect("卡片上该有摘要");
+
+    // 点这一行：跳转在这一帧末尾发生，选区下一帧才种进输入框
+    run(&ctx, &mut app, frame(0.9).click(pos + egui::vec2(4.0, 4.0)));
+    run(&ctx, &mut app, frame(1.0));
+
+    let row = diary::row_id(day);
+    let range = TextEditState::load(&ctx, row)
+        .expect("那一行该有输入状态")
+        .cursor
+        .char_range()
+        .expect("命中那一段该被选上");
+    assert_eq!(
+        (range.secondary.index.0, range.primary.index.0),
+        (4, 6),
+        "选中 `咖啡` 这两个字"
+    );
+    assert_eq!(
+        ctx.memory(|memory| memory.focused()),
+        Some(row),
+        "焦点该交给那一行"
+    );
+}
+
+/// 查询像日期：卡片第一行是"跳到这一天"；回车直接跳过去（那天没写过也行）。
+#[test]
+fn a_date_query_offers_a_jump_row_and_enter_goes_there() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, _spy) = fake_app();
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+
+    run(
+        &ctx,
+        &mut app,
+        frame(0.5).focused_on(field).text("2025-09-17"),
+    );
+    let card = texts(&run_output(&ctx, &mut app, frame(0.8).focused_on(field)));
+    assert!(
+        card.contains("跳到") && card.contains("2025.09.17"),
+        "日期查询该给一行跳转：{card}"
+    );
+    assert!(
+        !card.contains("没有找到"),
+        "有跳转行就不说「没有找到」：{card}"
+    );
+
+    // 回车：跳到那天（那天没写过也行）
+    run(&ctx, &mut app, frame(0.9).focused_on(field).enter());
+    let after = texts(&run_output(&ctx, &mut app, frame(1.0)));
+    assert!(after.contains("2025.09.17"), "顶栏该跳到那天：{after}");
+    assert!(!after.contains("跳到"), "跳过去之后卡片该收起：{after}");
+}
+
+/// Esc 清空查询并收起卡片。
+#[test]
+fn escape_clears_the_search() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    spy.borrow_mut()
+        .entries
+        .insert(today(), "今天喝了咖啡".to_owned());
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+
+    run(&ctx, &mut app, frame(0.5).focused_on(field).text("咖啡"));
+    let found = texts(&run_output(&ctx, &mut app, frame(0.8).focused_on(field)));
+    assert!(found.contains("找到 1 天"), "{found}");
+
+    let cleared = texts(&run_output(
+        &ctx,
+        &mut app,
+        frame(0.9).focused_on(field).escape(),
+    ));
+    assert!(
+        cleared.contains("搜索正文或日期"),
+        "查询该被清空：{cleared}"
+    );
+    assert!(!cleared.contains("找到"), "卡片该收起：{cleared}");
+}
+
+/// 锁定之后查询、命中与输入框缓冲都不留；解锁回来是空的。
+#[test]
+fn locking_clears_the_search() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    spy.borrow_mut()
+        .entries
+        .insert(today(), "今天喝了咖啡".to_owned());
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+
+    run(&ctx, &mut app, frame(0.5).focused_on(field).text("咖啡"));
+    let found = texts(&run_output(&ctx, &mut app, frame(0.8).focused_on(field)));
+    assert!(found.contains("找到 1 天"), "{found}");
+
+    app.lock(&ctx);
+    assert_eq!(spy.borrow().locks, 1, "落盘之后才丢密钥");
+    assert!(
+        TextEditState::load(&ctx, field).is_none(),
+        "锁定之后输入框的撤销缓冲（含一份查询）也要丢"
+    );
+
+    // 解锁回来：搜索框是空的，命中与卡片都不在了
+    let password = egui::Id::new(unlock::PASSWORD_FIELD_ID);
+    run(
+        &ctx,
+        &mut app,
+        frame(1.0).focused_on(password).text(PASSWORD),
+    );
+    run(&ctx, &mut app, frame(1.1).enter());
+    let printed = texts(&run_output(&ctx, &mut app, frame(1.2)));
+    assert!(
+        printed.contains("搜索正文或日期"),
+        "搜索框该是空的：{printed}"
+    );
+    assert!(!printed.contains("找到"), "命中不该还在：{printed}");
+}
+
+/// 搜索失败：红条说出来、卡片说"搜索失败"；下次改动重来一次。
+#[test]
+fn a_failed_search_says_so_and_recovers_on_the_next_edit() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    spy.borrow_mut()
+        .entries
+        .insert(today(), "今天喝了咖啡啊".to_owned());
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+
+    spy.borrow_mut().fail_searches = 1;
+    run(&ctx, &mut app, frame(0.5).focused_on(field).text("咖啡"));
+    let failed = texts(&run_output(&ctx, &mut app, frame(0.8).focused_on(field)));
+    assert!(failed.contains("替身搜不了"), "红条要说出来：{failed}");
+    assert!(failed.contains("搜索失败"), "卡片要说搜索失败：{failed}");
+    assert!(
+        !failed.contains("没有找到"),
+        "失败了就不该冒充「没有找到」：{failed}"
+    );
+
+    // 改一个字就重来一次：这次真搜到了
+    let retried = texts(&run_output(
+        &ctx,
+        &mut app,
+        frame(0.9).focused_on(field).text("啊"),
+    ));
+    assert!(retried.contains("搜索中…"), "{retried}");
+    let found = texts(&run_output(&ctx, &mut app, frame(1.2).focused_on(field)));
+    assert_eq!(
+        spy.borrow().searches,
+        vec!["咖啡".to_owned(), "咖啡啊".to_owned()]
+    );
+    assert!(found.contains("找到 1 天"), "{found}");
+}
+
+/// 搜索之前先落盘：搜索看到的是刚敲进去的那句（没等保存防抖）。
+#[test]
+fn a_search_flushes_pending_edits_first() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    let day = today();
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+    let row = diary::row_id(day);
+
+    // 先敲一个还没到点的查询，再把焦点交给正文、敲一句还没落盘的话
+    run(&ctx, &mut app, frame(0.5).focused_on(field).text("咖啡"));
+    run(
+        &ctx,
+        &mut app,
+        frame(0.6).focused_on(row).text("今天喝了咖啡"),
+    );
+
+    // 查询到点：搜索之前必须先把这一句写进库，否则搜不到刚敲的
+    let found = texts(&run_output(&ctx, &mut app, frame(0.8)));
+    assert_eq!(
+        spy.borrow().log,
+        vec![
+            Act::Apply(vec![Change::set(day, "今天喝了咖啡")]),
+            Act::Search("咖啡".to_owned()),
+        ],
+        "落盘要排在搜索前面"
+    );
+    assert!(found.contains("找到 1 天"), "搜索该看见刚敲的那句：{found}");
+}
+
+/// 收起卡片之后键盘当前行归零：再展开时 `Enter` 该打开第一行。
+///
+/// 场景：搜出两条命中 → 点外面收起 → 重新聚焦（不带方向键）→ 回车。
+/// 收起时若把 `selected` 留着，重新展开后回车打开的就是"收起前停的那一行"。
+#[test]
+fn reopening_the_card_starts_from_the_first_row() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    let day = today();
+    {
+        let mut spy = spy.borrow_mut();
+        spy.entries.insert(day, "今天喝了咖啡".to_owned());
+        spy.entries
+            .insert(day - chrono::Duration::days(1), "昨天也喝了咖啡".to_owned());
+    }
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+
+    // 搜出两天的命中
+    run(&ctx, &mut app, frame(0.5).focused_on(field).text("咖啡"));
+    let found = texts(&run_output(&ctx, &mut app, frame(0.8).focused_on(field)));
+    assert!(found.contains("找到 2 天"), "{found}");
+
+    // 点正文（卡片外面）收起
+    let outside = egui::pos2(900.0, 400.0);
+    run(&ctx, &mut app, frame(0.9).click(outside));
+    let closed = texts(&run_output(&ctx, &mut app, frame(0.95)));
+    assert!(!closed.contains("找到 2 天"), "点外面该收起卡片：{closed}");
+
+    // 重新聚焦（`Ctrl+F`），不碰方向键：卡片展开，当前行该是第一行
+    run(&ctx, &mut app, frame(1.0).command_f());
+    let reopened = texts(&run_output(&ctx, &mut app, frame(1.05).focused_on(field)));
+    assert!(reopened.contains("找到 2 天"), "重新聚焦该展开：{reopened}");
+
+    // 回车打开第一行：命中按日期从新到旧，第一条是今天
+    run(&ctx, &mut app, frame(1.1).focused_on(field).enter());
+    run(&ctx, &mut app, frame(1.15));
+
+    let row = diary::row_id(day);
+    assert_eq!(
+        ctx.memory(|memory| memory.focused()),
+        Some(row),
+        "回车该落到第一条命中（今天），而不是收起前停的第二条"
+    );
+    // `今天喝了咖啡` 里 `咖啡` 落在 4..6
+    let range = TextEditState::load(&ctx, row)
+        .expect("回第一行该跳到今天那一行")
+        .cursor
+        .char_range()
+        .expect("命中那一段该被选上");
+    assert_eq!(
+        (range.secondary.index.0, range.primary.index.0),
+        (4, 6),
+        "回车该打开第一行（今天）"
+    );
+}
+
+/// 删掉最后一个字：查询空了，命中与卡片一起清，且不留下一次会再扫库的计时。
+///
+/// 这一帧 `changed` 与 `dismissed` 同时为真（`SearchView::field` 里的 `emptied`）。
+/// 清掉优先：查询、命中、防抖计时一起归零，再聚焦不会拿旧结果冒充。
+#[test]
+fn emptying_the_query_drops_the_hits_and_the_timer() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    spy.borrow_mut()
+        .entries
+        .insert(today(), "今天喝了咖啡".to_owned());
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+
+    run(&ctx, &mut app, frame(0.5).focused_on(field).text("咖"));
+    let found = texts(&run_output(&ctx, &mut app, frame(0.8).focused_on(field)));
+    assert!(found.contains("找到 1 天"), "{found}");
+    assert_eq!(spy.borrow().searches.len(), 1, "该搜过一次");
+
+    // 退格删掉最后一个字：查询空了
+    run(&ctx, &mut app, frame(0.9).focused_on(field).backspace());
+    let emptied = texts(&run_output(&ctx, &mut app, frame(1.3).focused_on(field)));
+    assert!(
+        emptied.contains("搜索正文或日期"),
+        "查询该空了（只剩提示语）：{emptied}"
+    );
+    assert!(!emptied.contains("找到"), "命中的卡片该收起：{emptied}");
+    assert_eq!(
+        spy.borrow().searches.len(),
+        1,
+        "空查询不该再去扫库（防抖计时也该归零）"
+    );
+}
+
+/// 落盘失败还压在队里时又来一次搜索失败：红条该留着写盘那条，不被顶掉。
+///
+/// 落盘的错要用户点"重试"（编辑还在队里），搜索的错只是这一次查询没成。
+/// 写盘那条更急：被顶掉之后用户会以为问题只是查询没成。
+///
+/// 时序：查询的防抖（0.25s）比落盘（0.4s）短，所以要让正文先写失败一次、
+/// 再让查询到点——那时 `run_search` 里的 `flush` 会再失败一次，搜索也失败。
+#[test]
+fn a_search_failure_does_not_hide_a_save_failure() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx);
+    let (mut app, spy) = fake_app();
+    open_the_diary(&ctx, &mut app);
+    let field = egui::Id::new(SEARCH_FIELD_ID);
+    let row = diary::row_id(today());
+
+    // 正文那句一写就失败，之后一直失败（不让重试成功）；
+    // 搜索也失败一次
+    {
+        let mut spy = spy.borrow_mut();
+        spy.fail_next = 99;
+        spy.fail_searches = 1;
+    }
+
+    // 先敲正文：过 0.4 秒防抖写一次，失败，编辑压回队里
+    run(
+        &ctx,
+        &mut app,
+        frame(0.4).focused_on(row).text("今天喝了咖啡"),
+    );
+    let stuck = texts(&run_output(&ctx, &mut app, frame(0.9).focused_on(row)));
+    assert!(stuck.contains("替身装的写盘失败"), "写盘该先失败：{stuck}");
+    assert!(stuck.contains("重试"), "写盘失败时错误条该给重试：{stuck}");
+
+    // 再敲查询并等它到点：这一次 `run_search` 里 flush 还是失败，搜索也失败
+    run(&ctx, &mut app, frame(1.0).focused_on(field).text("咖啡"));
+    let failed = texts(&run_output(&ctx, &mut app, frame(1.5).focused_on(field)));
+    assert!(
+        failed.contains("替身装的写盘失败"),
+        "红条该继续说写盘失败（编辑还没写进去）：{failed}"
+    );
+    assert!(
+        !failed.contains("替身搜不了"),
+        "搜索的错不该把写盘的错顶掉：{failed}"
+    );
 }

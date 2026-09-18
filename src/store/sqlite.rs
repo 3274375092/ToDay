@@ -4,13 +4,14 @@
 //! 日期用明文存，日历打点和翻月都只是一次带索引的范围查询，
 //! 而内容列是密文，直接打开库文件看不到一个字。
 
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 use super::{StoreError, Vault};
 use crate::crypto::{self, FORMAT_VERSION, KdfParams, Session};
 use crate::model::{Change, MonthKey, MonthSheet, format_date, parse_date};
+use crate::search::{self, SearchResults};
 
 /// `meta` 表里已占用的键
 const META_KDF_PARAMS: &str = "kdf.params";
@@ -145,15 +146,42 @@ impl Vault for SqliteVault {
 
         for row in rows {
             let (date_text, body) = row?;
-            let date = parse_date(&date_text)
-                .ok_or_else(|| StoreError::Corrupt(format!("日期列无法解析：{date_text}")))?;
-            // 密码已经验过了，这里解不开只可能是数据坏了
-            let text = session
-                .open(&date_text, &body)
-                .map_err(|_| StoreError::Corrupt(format!("{date_text} 这一天的密文解不开")))?;
+            let (date, text) = open_row(session, &date_text, &body)?;
             sheet.set(date, &text);
         }
         Ok(sheet)
+    }
+
+    fn search(&self, needle: &str) -> Result<SearchResults, StoreError> {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            return Ok(SearchResults::default());
+        }
+        let session = self.session.as_ref().ok_or(StoreError::Locked)?;
+
+        let mut results = SearchResults::default();
+        // 倒序取：收满 `MAX_HITS` 就停时，留下的正好是最近的那些天。
+        // `date` 是 TEXT PRIMARY KEY，这个排序走它的索引，不必另建一个
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT date, body FROM entries ORDER BY date DESC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        for row in rows {
+            let (date_text, body) = row?;
+            let (date, text) = open_row(session, &date_text, &body)?;
+            if let Some(hit) = search::hit(date, &text, needle) {
+                if results.hits.len() >= search::MAX_HITS {
+                    // 已经收满，而这里又多出一条：确实截了
+                    results.truncated = true;
+                    break;
+                }
+                results.hits.push(hit);
+            }
+        }
+        Ok(results)
     }
 
     fn apply(&mut self, changes: &[Change]) -> Result<(), StoreError> {
@@ -194,6 +222,23 @@ impl Vault for SqliteVault {
         tx.commit()?;
         Ok(())
     }
+}
+
+/// 把库里的一行还原成（日期，明文正文）。
+///
+/// 密码已经验过，日期解析不了、密文解不开都只可能是数据坏了；
+/// 与 [`Vault::load_month`] 同一口径：宁可报错，不要悄悄少几天。
+fn open_row(
+    session: &Session,
+    date_text: &str,
+    body: &[u8],
+) -> Result<(NaiveDate, String), StoreError> {
+    let date = parse_date(date_text)
+        .ok_or_else(|| StoreError::Corrupt(format!("日期列无法解析：{date_text}")))?;
+    let text = session
+        .open(date_text, body)
+        .map_err(|_| StoreError::Corrupt(format!("{date_text} 这一天的密文解不开")))?;
+    Ok((date, text))
 }
 
 /// 连接级别的一次性设置
